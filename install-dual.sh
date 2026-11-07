@@ -390,10 +390,14 @@ else
 fi
 
 echo
-yellow "确认开始安装？输入 YES 继续。"
+yellow "确认开始安装？输入 yes 或 y 继续。"
 read -r -p "> " CONFIRM
-[[ "$CONFIRM" == "YES" ]] || die "已取消。"
 
+if [[ "$CONFIRM" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]; then
+  :
+else
+  die "已取消。"
+fi
 # ------------------- 覆盖保护、端口检查与事务备份 -------------------
 
 green "安装前覆盖保护检查"
@@ -780,7 +784,14 @@ systemctl is-active node-panel
 
 echo
 echo "===== 监听端口 ====="
-for p in "$WS_PORT" "$REALITY_PORT" "$PANEL_PORT"; do
+
+PORTS_TO_CHECK=("$WS_PORT" "$PANEL_PORT")
+
+if (( REALITY_ENABLED )); then
+  PORTS_TO_CHECK+=("$REALITY_PORT")
+fi
+
+for p in "${PORTS_TO_CHECK[@]}"; do
   if ! ss -H -lnt 2>/dev/null | awk -v p=":$p" '$4 ~ (p "$") {found=1} END {exit !found}'; then
     die "端口 $p 未监听，安装验收失败。"
   fi
@@ -809,21 +820,25 @@ echo "  源站：127.0.0.1:$WS_PORT"
 echo "  UUID：$WS_UUID"
 echo "  Path：$WS_PATH"
 echo
-echo "REALITY 节点："
-echo "  地址：$REALITY_ADDR"
-echo "  端口：$REALITY_PORT"
-echo "  UUID：$REALITY_UUID"
-echo "  SNI：$REALITY_SNI"
-echo "  Public Key：$REALITY_PUBLIC_KEY"
-echo "  Short ID：$REALITY_SHORT_ID"
-echo "  Flow：xtls-rprx-vision"
+if (( REALITY_ENABLED )); then
+  echo "REALITY 节点："
+  echo "  地址：$REALITY_ADDR"
+  echo "  端口：$REALITY_PORT"
+  echo "  UUID：$REALITY_UUID"
+  echo "  SNI：$REALITY_SNI"
+  echo "  Public Key：$REALITY_PUBLIC_KEY"
+  echo "  Short ID：$REALITY_SHORT_ID"
+  echo "  Flow：xtls-rprx-vision"
+fi
 echo
 yellow "Cloudflare Tunnel 需要你自行配置："
 echo "  $WS_HOST -> HTTP -> 127.0.0.1:$WS_PORT"
 echo "  面板域名 -> HTTP -> 127.0.0.1:$PANEL_PORT"
 echo
-yellow "REALITY 需要 VPS 服务商允许 TCP $REALITY_PORT 入站。"
-yellow "如果运行在容器内，还需要宿主机映射该 TCP 端口。"
+if (( REALITY_ENABLED )); then
+  yellow "REALITY 需要 VPS 服务商允许 TCP $REALITY_PORT 入站。"
+  yellow "如果运行在容器内，还需要宿主机映射该 TCP 端口。"
+fi
 yellow "本脚本没有安装、登录或配置 Cloudflared。"
 echo
 echo "查看日志："
