@@ -37,6 +37,7 @@ STATE_FILE="state.txt"
 MANIFEST_FILE="manifest.tsv"
 DIRS_FILE="dirs.txt"
 META_FILE="meta.txt"
+HASH_FILE="hashes.tsv"
 
 red(){ echo -e "\033[31m$*\033[0m"; }
 green(){ echo -e "\033[32m$*\033[0m"; }
@@ -125,6 +126,7 @@ BACKUP_DIR=""
 TRANSACTION_ID=""
 CREATED_AT=""
 CURRENT_STAGE=""
+MANIFEST_COMPLETE=0
 PASSWORD_FILE=""
 declare -a TRACK_DIRS=()
 
@@ -138,13 +140,19 @@ state_get(){
   printf '%s' "${line#*=}"
 }
 
-# 原子写入事务状态文件（临时文件 + rename），权限 600
+# 原子写入事务状态文件（临时文件 + rename），权限 600。
+# 任何一步（写入 / chmod / rename）失败都必须返回非 0 并明确报错，
+# 绝不静默忽略，以免状态文件与实际部署不一致。
 state_write(){
   local status="$1" stage="${2:-$CURRENT_STAGE}"
-  [[ -n "${BACKUP_DIR:-}" && -d "${BACKUP_DIR:-}" ]] || return 0
   CURRENT_STAGE="$stage"
+  if [[ -z "${BACKUP_DIR:-}" || ! -d "${BACKUP_DIR:-}" ]]; then
+    red "错误：事务备份目录不存在，无法写入状态文件（status=$status）。"
+    return 1
+  fi
   local tmp="$BACKUP_DIR/.state.txt.tmp.$$"
-  {
+  local target="$BACKUP_DIR/$STATE_FILE"
+  if ! {
     printf 'transaction_id=%s\n' "${TRANSACTION_ID:-}"
     printf 'created_at=%s\n' "${CREATED_AT:-}"
     printf 'updated_at=%s\n' "$(now_iso)"
@@ -154,33 +162,168 @@ state_write(){
     printf 'xray_was_enabled=%s\n' "${XRAY_WAS_ENABLED:-0}"
     printf 'node_panel_was_active=%s\n' "${NODEPANEL_WAS_ACTIVE:-0}"
     printf 'node_panel_was_enabled=%s\n' "${NODEPANEL_WAS_ENABLED:-0}"
-  } > "$tmp" 2>/dev/null || return 0
-  chmod 600 "$tmp" 2>/dev/null || true
-  mv -f -- "$tmp" "$BACKUP_DIR/$STATE_FILE" 2>/dev/null || true
+    printf 'manifest_complete=%s\n' "${MANIFEST_COMPLETE:-0}"
+  } > "$tmp"; then
+    red "错误：无法写入状态临时文件：$tmp"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! chmod 600 "$tmp"; then
+    red "错误：无法设置状态文件权限（应为 600）：$tmp"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! grep -q "^status=${status}$" "$tmp"; then
+    red "错误：状态临时文件内容校验失败：$tmp"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$target"; then
+    red "错误：无法替换状态文件：$target"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  return 0
 }
 
-set_stage(){ state_write "IN_PROGRESS" "$1"; }
+# 阶段推进：状态写入失败必须阻止安装继续
+set_stage(){
+  if ! state_write "IN_PROGRESS" "$1"; then
+    die "无法更新安装状态（阶段：$1），安装中止。"
+  fi
+}
 
-# 记录一个受事务管理的文件：src 为真实路径，rel 为备份目录内相对路径
+# 文件指纹：MISSING（不存在）/ LINK:<目标>（符号链接）/ sha256:<摘要>
+file_fingerprint(){
+  local f="$1" h
+  if [[ -L "$f" ]]; then
+    printf 'LINK:%s' "$(readlink -- "$f" 2>/dev/null || echo '?')"
+  elif [[ -f "$f" ]]; then
+    h="$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')" || true
+    if [[ -n "$h" ]]; then printf 'sha256:%s' "$h"; else printf 'HASHFAIL'; fi
+  else
+    printf 'MISSING'
+  fi
+}
+
+# 记录一个受事务管理的文件：src 为真实路径，rel 为备份目录内相对路径。
+# 清单第四列为备份时刻的“安装前指纹”，恢复时用于校验目标文件归属。
 track_file(){
   local src="$1"
   local rel="$2"
   local dst="$BACKUP_DIR/$rel"
-  local existed=0
+  local existed=0 pre="MISSING"
   mkdir -p "$(dirname "$dst")"
   if [[ -e "$src" || -L "$src" ]]; then
     cp -a -- "$src" "$dst"
     existed=1
+    pre="$(file_fingerprint "$src")"
   else
     : > "$dst.absent"
+    pre="MISSING"
   fi
-  printf '%s\t%s\t%s\n' "$src" "$rel" "$existed" >> "$BACKUP_DIR/$MANIFEST_FILE"
+  printf '%s\t%s\t%s\t%s\n' "$src" "$rel" "$existed" "$pre" >> "$BACKUP_DIR/$MANIFEST_FILE"
+}
+
+# 记录某文件当前的“事务指纹”（追加写入 hashes.tsv，同路径以最后一条为准）
+record_hash(){
+  local src="$1"
+  [[ -n "${BACKUP_DIR:-}" && -d "${BACKUP_DIR:-}" ]] || return 0
+  printf '%s\t%s\n' "$src" "$(file_fingerprint "$src")" >> "$BACKUP_DIR/$HASH_FILE"
+}
+
+# 为清单中所有受管文件记录当前指纹
+record_manifest_hashes(){
+  local manifest="$1"
+  [[ -f "$manifest" ]] || return 0
+  local s r e pre
+  while IFS=$'\t' read -r s r e pre; do
+    [[ -n "${s:-}" ]] || continue
+    record_hash "$s"
+  done < "$manifest"
+}
+
+# 读取 hashes.tsv 中某文件的最新指纹（无则输出空）
+hash_of(){
+  local dir="$1" src="$2"
+  awk -F'\t' -v s="$src" '$1==s{v=$2} END{if(v!="")print v}' "$dir/$HASH_FILE" 2>/dev/null || true
+}
+
+# 判断某路径是否由该事务管理（出现在清单中）
+manifest_has(){
+  local dir="$1" path="$2"
+  [[ -f "$dir/$MANIFEST_FILE" ]] || return 1
+  awk -F'\t' -v p="$path" '$1==p{found=1} END{exit !found}' "$dir/$MANIFEST_FILE"
+}
+
+# 恢复服务启用状态：安装前未启用则必须确保恢复后仍未启用
+restore_enabled(){
+  local unit="$1" was="$2"
+  if [[ "$was" == "1" ]]; then
+    systemctl enable "$unit" >/dev/null 2>&1 || return 1
+  elif svc_exists "$unit"; then
+    systemctl disable "$unit" >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+# 恢复服务运行状态：安装前未运行则必须确保恢复后仍未运行
+restore_active(){
+  local unit="$1" was="$2"
+  if [[ "$was" == "1" ]]; then
+    systemctl start "$unit" >/dev/null 2>&1 || return 1
+  elif svc_exists "$unit"; then
+    systemctl stop "$unit" >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+# 校验服务最终状态是否与安装前一致（active 与 enabled 都要一致）
+verify_service_state(){
+  local unit="$1" wa="$2" we="$3" ok=1
+  if svc_exists "$unit"; then
+    if [[ "$we" == "1" ]]; then svc_enabled "$unit" || ok=0; else svc_enabled "$unit" && ok=0; fi
+    if [[ "$wa" == "1" ]]; then svc_active "$unit" || ok=0; else svc_active "$unit" && ok=0; fi
+  fi
+  (( ok == 1 ))
+}
+
+# 恢复前校验：目标文件必须与事务预期一致，否则停止恢复（绝不覆盖外部修改）。
+# 仅用于 --recover（在新 Shell 中独立运行，无法信任进程内状态）。
+verify_recovery_targets(){
+  local dir="$1"
+  local manifest="$dir/$MANIFEST_FILE"
+  local failed=0 s r e pre expected cur
+  if [[ ! -f "$manifest" ]]; then
+    red "缺少事务清单，无法校验恢复目标：$manifest"
+    return 1
+  fi
+  while IFS=$'\t' read -r s r e pre; do
+    [[ -n "${s:-}" ]] || continue
+    if [[ "$s" != /* || "$s" == *..* ]]; then
+      red "校验失败：清单中的路径非法：$s"; failed=1; continue
+    fi
+    expected="$(hash_of "$dir" "$s")"
+    [[ -n "$expected" ]] || expected="${pre:-}"
+    if [[ -z "$expected" ]]; then
+      red "校验失败：无法确认文件归属（缺少指纹）：$s"; failed=1; continue
+    fi
+    cur="$(file_fingerprint "$s")"
+    if [[ "$cur" != "$expected" ]]; then
+      red "校验失败：目标文件与事务预期不一致（可能被外部修改）：$s"
+      red "          期望：$expected"
+      red "          实际：$cur"
+      failed=1
+    fi
+  done < "$manifest"
+  (( failed == 0 ))
 }
 
 # 按事务清单恢复（供自动回滚与 --recover 共用）。
 # 完全依赖磁盘上的清单/状态文件，可在新的 Shell 中独立运行。
+# verify=1（--recover）时先校验目标文件与事务预期一致，不一致则停止，绝不覆盖。
 restore_transaction(){
-  local dir="$1"
+  local dir="$1" verify="${2:-0}"
   local st="$dir/$STATE_FILE"
   local manifest="$dir/$MANIFEST_FILE"
   local dirs="$dir/$DIRS_FILE"
@@ -192,6 +335,13 @@ restore_transaction(){
     return 1
   fi
 
+  if [[ "$verify" == "1" ]]; then
+    if ! verify_recovery_targets "$dir"; then
+      red "目标文件与事务预期不一致，已停止恢复以避免覆盖外部修改。"
+      return 1
+    fi
+  fi
+
   local xa xe na ne xu_existed xg_existed
   xa="$(state_get "$st" xray_was_active)"
   xe="$(state_get "$st" xray_was_enabled)"
@@ -200,13 +350,31 @@ restore_transaction(){
   xu_existed="$(state_get "$meta" xray_user_existed)"
   xg_existed="$(state_get "$meta" xray_group_existed)"
 
-  # 事务内创建的服务由本次事务负责停止
-  systemctl stop "$PANEL_SERVICE" >/dev/null 2>&1 || true
-  systemctl stop "$XRAY_SERVICE" >/dev/null 2>&1 || true
+  # 只停止“由本事务管理”的服务，避免影响不属于本事务的外部服务。
+  local panel_owned=0 xray_owned=0
+  if manifest_has "$dir" "$NODE_PANEL_UNIT"; then panel_owned=1; fi
+  if manifest_has "$dir" "/usr/local/bin/xray" ||
+     manifest_has "$dir" "/etc/systemd/system/xray.service" ||
+     manifest_has "$dir" "/lib/systemd/system/xray.service" ||
+     manifest_has "$dir" "/usr/local/lib/systemd/system/xray.service"; then
+    xray_owned=1
+  fi
+  if (( panel_owned )); then
+    systemctl stop "$PANEL_SERVICE" >/dev/null 2>&1 || true
+    if [[ "$ne" != "1" ]]; then
+      systemctl disable "$PANEL_SERVICE" >/dev/null 2>&1 || true
+    fi
+  fi
+  if (( xray_owned )); then
+    systemctl stop "$XRAY_SERVICE" >/dev/null 2>&1 || true
+    if [[ "$xe" != "1" ]]; then
+      systemctl disable "$XRAY_SERVICE" >/dev/null 2>&1 || true
+    fi
+  fi
 
   local -a S=() R=() E=()
   local s r e
-  while IFS=$'\t' read -r s r e; do
+  while IFS=$'\t' read -r s r e _; do
     [[ -n "${s:-}" ]] || continue
     S+=("$s"); R+=("$r"); E+=("$e")
   done < "$manifest"
@@ -214,6 +382,10 @@ restore_transaction(){
   local i src rel existed bak
   for ((i=${#S[@]}-1; i>=0; i--)); do
     src="${S[$i]}"; rel="${R[$i]}"; existed="${E[$i]}"
+    # 防御：拒绝可疑清单路径，避免误删/误写
+    if [[ "$src" != /* || "$src" == *..* || "$rel" == /* || "$rel" == *..* ]]; then
+      red "恢复失败：清单路径非法（src=$src rel=$rel）"; failed=1; continue
+    fi
     bak="$dir/$rel"
     if [[ "$existed" == "1" ]]; then
       if [[ -e "$bak" || -L "$bak" ]]; then
@@ -236,7 +408,7 @@ restore_transaction(){
   # 删除本次新建的空目录（仅当为空时）
   if [[ -f "$dirs" ]]; then
     while IFS= read -r d; do
-      [[ -n "$d" ]] || continue
+      [[ "$d" == /* && "$d" != *..* ]] || continue
       rmdir -- "$d" 2>/dev/null || true
     done < "$dirs"
   fi
@@ -266,23 +438,23 @@ restore_transaction(){
     fi
   fi
 
-  # 恢复启用状态
-  if [[ "$xe" == "1" ]]; then
-    systemctl enable "$XRAY_SERVICE" >/dev/null 2>&1 || failed=1
+  # 对称恢复服务状态，但仅限“由本事务管理”的服务，
+  # 避免影响不属于本事务的外部服务状态。
+  # 安装前未启用则必须确保仍未启用；安装前未运行则必须确保仍未运行。
+  if (( xray_owned )); then
+    restore_enabled "$XRAY_SERVICE" "$xe" ||
+      { red "恢复失败：无法恢复 $XRAY_SERVICE 的启用状态"; failed=1; }
+    restore_active "$XRAY_SERVICE" "$xa" ||
+      { red "恢复失败：无法恢复 $XRAY_SERVICE 的运行状态"; failed=1; }
   fi
-  if [[ "$ne" == "1" ]]; then
-    systemctl enable "$PANEL_SERVICE" >/dev/null 2>&1 || failed=1
+  if (( panel_owned )); then
+    restore_enabled "$PANEL_SERVICE" "$ne" ||
+      { red "恢复失败：无法恢复 $PANEL_SERVICE 的启用状态"; failed=1; }
+    restore_active "$PANEL_SERVICE" "$na" ||
+      { red "恢复失败：无法恢复 $PANEL_SERVICE 的运行状态"; failed=1; }
   fi
 
-  # 恢复运行状态
-  if [[ "$xa" == "1" ]]; then
-    systemctl start "$XRAY_SERVICE" >/dev/null 2>&1 || failed=1
-  fi
-  if [[ "$na" == "1" ]]; then
-    systemctl start "$PANEL_SERVICE" >/dev/null 2>&1 || failed=1
-  fi
-
-  # 校验恢复结果
+  # 校验文件恢复结果
   for ((i=0; i<${#S[@]}; i++)); do
     src="${S[$i]}"; rel="${R[$i]}"; existed="${E[$i]}"
     if [[ "$existed" == "1" ]]; then
@@ -292,6 +464,14 @@ restore_transaction(){
     fi
   done
 
+  # 校验服务 active 与 enabled 是否都恢复到安装前状态（仅校验本事务管理的服务）
+  if (( xray_owned )) && ! verify_service_state "$XRAY_SERVICE" "$xa" "$xe"; then
+    red "校验失败：$XRAY_SERVICE 的运行或启用状态与安装前不一致"; failed=1
+  fi
+  if (( panel_owned )) && ! verify_service_state "$PANEL_SERVICE" "$na" "$ne"; then
+    red "校验失败：$PANEL_SERVICE 的运行或启用状态与安装前不一致"; failed=1
+  fi
+
   (( failed == 0 ))
 }
 
@@ -299,13 +479,16 @@ restore_transaction(){
 rollback_all(){
   [[ -n "${BACKUP_DIR:-}" && -d "${BACKUP_DIR:-}" ]] || return 1
   yellow "正在回滚本次安装……"
-  state_write "ROLLBACK_IN_PROGRESS" "rollback"
+  state_write "ROLLBACK_IN_PROGRESS" "rollback" ||
+    red "警告：无法写入回滚状态（继续尝试回滚文件）。"
   if restore_transaction "$BACKUP_DIR"; then
-    state_write "ROLLED_BACK" "rolled-back"
+    state_write "ROLLED_BACK" "rolled-back" ||
+      red "警告：无法写入回滚完成状态。"
     green "回滚完成：已恢复安装前文件状态。备份保留在：$BACKUP_DIR"
     return 0
   else
-    state_write "ROLLBACK_FAILED" "rollback-failed"
+    state_write "ROLLBACK_FAILED" "rollback-failed" ||
+      red "警告：无法写入回滚失败状态。"
     red "回滚未能完全完成。请保留并检查备份目录：$BACKUP_DIR"
     return 1
   fi
@@ -350,24 +533,30 @@ acquire_lock(){
 # =========================================================
 # 未完成 / 回滚失败事务扫描
 # =========================================================
+# 列出所有事务目录。刻意包含缺少状态文件的目录：
+# 事务目录一经创建即应可识别，缺失状态属于异常，必须被发现而非静默忽略。
 list_transactions(){
   local d
   shopt -s nullglob
   for d in "${BACKUP_PREFIX}"*; do
-    [[ -d "$d" && -f "$d/$STATE_FILE" ]] && printf '%s\n' "$d"
+    [[ -d "$d" ]] && printf '%s\n' "$d"
   done
   shopt -u nullglob
 }
 
-# 打印所有未完成（IN_PROGRESS / ROLLBACK_IN_PROGRESS）或回滚失败的事务
+# 打印所有未完成（IN_PROGRESS / ROLLBACK_IN_PROGRESS）、回滚失败，
+# 或状态未知/状态文件缺失（异常目录）的事务。
 find_unfinished_transactions(){
   local d status
   while IFS= read -r d; do
     [[ -n "$d" ]] || continue
     status="$(state_get "$d/$STATE_FILE" status)"
     case "$status" in
-      IN_PROGRESS|ROLLBACK_IN_PROGRESS|ROLLBACK_FAILED)
-        printf '%s\t%s\t%s\n' "$d" "$status" "$(state_get "$d/$STATE_FILE" current_stage)"
+      COMMITTED|ROLLED_BACK|NOT_STARTED)
+        ;;
+      *)
+        # 包括空状态（状态文件缺失/损坏）——一律视为需要关注的异常事务
+        printf '%s\t%s\t%s\n' "$d" "${status:-UNKNOWN}" "$(state_get "$d/$STATE_FILE" current_stage)"
         ;;
     esac
   done < <(list_transactions)
@@ -608,7 +797,9 @@ check_mode(){
         echo "           - $d  状态=$status"
         ;;
       *)
-        echo "           - $d  状态未知或状态文件缺失"
+        # 状态未知或状态文件缺失：异常事务目录，必须显式报出而不是静默忽略
+        unfinished=$((unfinished+1))
+        echo "           - $d  状态未知或状态文件缺失（异常事务目录）"
         ;;
     esac
   done < <(list_transactions)
@@ -636,9 +827,10 @@ check_mode(){
     red "自动回滚失败，需要人工处理。"
     echo "  存在回滚失败的事务。请保留备份目录，执行 --recover 查看，必要时人工恢复。"
   elif (( unfinished > 0 )); then
-    red "安装中断，存在未完成事务。"
+    red "安装中断，存在未完成或异常的安装事务。"
     echo "  请先执行：bash install-dual.sh --recover"
     echo "  恢复完成前不要重新安装，也不要删除残留文件。"
+    echo "  若事务缺少状态文件（异常事务目录），--recover 会拒绝自动恢复，需人工核对。"
   elif (( complete )); then
     if svc_active "$XRAY_SERVICE" && svc_active "$PANEL_SERVICE"; then
       yellow "已安装（完整），禁止重复安装。"
@@ -661,7 +853,11 @@ check_mode(){
 # =========================================================
 # 恢复模式 --recover
 # =========================================================
-# 校验事务备份是否完整、可自动恢复
+# 校验事务备份是否完整、可自动恢复。任何一项不满足都拒绝恢复：
+#   1) 事务 ID 与状态字段；
+#   2) 清单路径合法性（禁止信任未经验证的清单路径）；
+#   3) 备份完整性（existed=1 必须有对应备份）；
+#   4) “原本不存在”文件的记录（existed=0 必须有 .absent 标记）。
 verify_transaction(){
   local dir="$1"
   local st="$dir/$STATE_FILE"
@@ -671,20 +867,49 @@ verify_transaction(){
   [[ -f "$st" ]] || issues+=("缺少状态文件 state.txt")
   [[ -f "$manifest" ]] || issues+=("缺少事务清单 manifest.tsv")
 
+  # 1) 事务 ID 与状态字段
+  local tid status
   if [[ -f "$st" ]]; then
-    state_get "$st" transaction_id >/dev/null 2>&1
-    [[ -n "$(state_get "$st" status)" ]] || issues+=("状态文件缺少 status 字段")
+    tid="$(state_get "$st" transaction_id)"
+    status="$(state_get "$st" status)"
+    [[ -n "$tid" ]] || issues+=("状态文件缺少 transaction_id")
+    [[ -n "$status" ]] || issues+=("状态文件缺少 status 字段")
+    case "$status" in
+      IN_PROGRESS|ROLLBACK_IN_PROGRESS|ROLLBACK_FAILED|COMMITTED|ROLLED_BACK|NOT_STARTED) ;;
+      *) issues+=("状态字段取值非法：${status:-空}") ;;
+    esac
+    [[ -z "$tid" || "$tid" == "$(basename "$dir")" ]] ||
+      issues+=("事务 ID 与目录名不一致：$tid != $(basename "$dir")")
   fi
 
+  # 2) 清单路径合法性 + 3) 备份完整性 + 4) 原本不存在文件的记录
   if [[ -f "$manifest" ]]; then
-    local s r e bak
-    while IFS=$'\t' read -r s r e; do
+    [[ -s "$manifest" ]] || issues+=("事务清单为空：$manifest")
+    local s r e bak n=0
+    while IFS=$'\t' read -r s r e _; do
       [[ -n "${s:-}" ]] || continue
-      if [[ "$e" == "1" ]]; then
-        bak="$dir/$r"
-        [[ -e "$bak" || -L "$bak" ]] || issues+=("备份不完整：缺少 $bak")
+      n=$((n+1))
+      if [[ "$s" != /* || "$s" == *..* || "$s" == *$'\t'* ]]; then
+        issues+=("清单路径非法（src）：$s"); continue
       fi
+      if [[ -z "${r:-}" || "$r" == /* || "$r" == *..* ]]; then
+        issues+=("清单相对路径非法（rel）：$r"); continue
+      fi
+      case "$e" in
+        1)
+          bak="$dir/$r"
+          [[ -e "$bak" || -L "$bak" ]] || issues+=("备份不完整：缺少 $bak")
+          ;;
+        0)
+          [[ -e "$dir/$r.absent" || -L "$dir/$r.absent" ]] ||
+            issues+=("缺少 absent 标记（原本不存在）：$dir/$r.absent")
+          ;;
+        *)
+          issues+=("清单记录非法（existed=$e）：$s")
+          ;;
+      esac
     done < "$manifest"
+    (( n > 0 )) || issues+=("事务清单没有任何记录")
   fi
 
   if (( ${#issues[@]} > 0 )); then
@@ -770,18 +995,23 @@ recover_mode(){
   TRANSACTION_ID="$(state_get "$st" transaction_id)"
   CREATED_AT="$(state_get "$st" created_at)"
   CURRENT_STAGE="recover"
+  MANIFEST_COMPLETE="$(state_get "$st" manifest_complete)"
   XRAY_WAS_ACTIVE="$(state_get "$st" xray_was_active)"
   XRAY_WAS_ENABLED="$(state_get "$st" xray_was_enabled)"
   NODEPANEL_WAS_ACTIVE="$(state_get "$st" node_panel_was_active)"
   NODEPANEL_WAS_ENABLED="$(state_get "$st" node_panel_was_enabled)"
-  state_write "ROLLBACK_IN_PROGRESS" "recover"
+  state_write "ROLLBACK_IN_PROGRESS" "recover" ||
+    die "无法写入恢复状态（ROLLBACK_IN_PROGRESS），已中止恢复以避免状态不一致。"
 
-  if restore_transaction "$dir"; then
-    state_write "ROLLED_BACK" "rolled-back"
+  # verify=1：恢复前逐一校验目标文件与事务预期一致，不一致则停止，绝不覆盖。
+  if restore_transaction "$dir" 1; then
+    state_write "ROLLED_BACK" "rolled-back" ||
+      red "警告：无法写入恢复完成状态。"
     green "恢复完成：事务已回滚成功，备份保留在：$dir"
     return 0
   else
-    state_write "ROLLBACK_FAILED" "rollback-failed"
+    state_write "ROLLBACK_FAILED" "rollback-failed" ||
+      red "警告：无法写入恢复失败状态。"
     red "恢复未能完全完成。已保留全部备份，请人工核对：$dir"
     return 1
   fi
@@ -997,11 +1227,18 @@ detect_existing
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$(mktemp -d "${BACKUP_PREFIX}${STAMP}.XXXXXX")"
-mkdir -p "$BACKUP_DIR/files"
-chmod 700 "$BACKUP_DIR"
 TRANSACTION_ID="$(basename "$BACKUP_DIR")"
 CREATED_AT="$(now_iso)"
-: > "$BACKUP_DIR/$MANIFEST_FILE"
+chmod 700 "$BACKUP_DIR" || die "无法设置事务目录权限：$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR/files" || die "无法创建事务目录结构：$BACKUP_DIR"
+: > "$BACKUP_DIR/$MANIFEST_FILE" || die "无法创建事务清单：$BACKUP_DIR"
+
+# 事务目录创建后立即写入可识别的初始状态：
+# 即使此后（创建清单、记录备份期间）被 SIGKILL，--check 与安装前置检查
+# 也能发现该异常事务目录，而不会静默忽略。
+MANIFEST_COMPLETE=0
+state_write "IN_PROGRESS" "init" ||
+  die "无法写入初始事务状态，安装中止（备份目录：$BACKUP_DIR）。"
 
 for d in \
   "$PANEL_DIR" \
@@ -1048,7 +1285,9 @@ track_file "/lib/systemd/system/xray.service" "files/xray-lib.service"
 track_file "/lib/systemd/system/xray@.service" "files/xray-lib-template.service"
 track_file "/usr/local/bin/xray" "files/xray-bin"
 
-state_write "IN_PROGRESS" "init"
+# 清单记录完毕，标记清单完整；此后状态文件将携带 manifest_complete=1
+MANIFEST_COMPLETE=1
+set_stage "init"
 ROLLBACK_READY=1
 
 # 创建目录放在备份记录之后，失败时可清理新建的空目录。
@@ -1223,6 +1462,9 @@ chmod 640 "$XRAY_CONFIG"
 "$XRAY_BIN" run -test -config "$XRAY_CONFIG" ||
   die "Xray 配置检查失败。"
 
+# 记录写入后的事务指纹，供 --recover 校验目标文件归属
+record_hash "$XRAY_CONFIG"
+
 # ------------------- 安装新版面板 -------------------
 
 set_stage "5/8 安装面板"
@@ -1233,6 +1475,8 @@ curl -fsSL "$PANEL_URL" -o "$PANEL_FILE" ||
 
 grep -q 'PANEL_CONFIG = Path("/etc/node-panel/panel-config.json")' "$PANEL_FILE" ||
   die "下载到的文件不是预期的 panel_dual.py。"
+
+record_hash "$PANEL_FILE"
 
 # ------------------- 生成面板配置 -------------------
 
@@ -1282,6 +1526,8 @@ tmp.replace(path)
 PY
 
 chmod 600 "$PANEL_CONFIG"
+
+record_hash "$PANEL_CONFIG"
 
 python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$PANEL_FILE" ||
   die "面板 Python 语法检查失败。"
@@ -1336,6 +1582,9 @@ rm -f "$PASSWORD_FILE"
 PASSWORD_FILE=""
 unset PANEL_PASSWORD
 
+record_hash "$AUTH_FILE"
+record_hash "$SECRET_FILE"
+
 # ------------------- systemd 服务 -------------------
 
 set_stage "7/8 创建服务"
@@ -1364,6 +1613,8 @@ ReadWritePaths=/etc/node-panel /usr/local/etc/xray
 WantedBy=multi-user.target
 EOF
 
+record_hash "$NODE_PANEL_UNIT"
+
 # Xray 服务自愈：使用 systemd drop-in 设置 Restart=on-failure，
 # 不改写官方安装器生成的 xray.service，也不覆盖用户已有 drop-in。
 mkdir -p "$(dirname "$XRAY_RESTART_DROPIN")"
@@ -1376,6 +1627,7 @@ Restart=on-failure
 RestartSec=5s
 EOF
   chmod 644 "$XRAY_RESTART_DROPIN"
+  record_hash "$XRAY_RESTART_DROPIN"
 fi
 
 systemctl daemon-reload
@@ -1387,6 +1639,9 @@ systemctl enable --now node-panel
 
 set_stage "8/8 最终检查"
 green "[8/8] 最终检查"
+
+# 所有受管文件均已就位，刷新事务指纹，确保 --recover 校验覆盖全部清单条目
+record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE"
 
 "$XRAY_BIN" run -test -config "$XRAY_CONFIG" ||
   die "Xray 最终配置检查失败。"
@@ -1423,9 +1678,10 @@ done
 
 echo
 echo "===== 面板页面检查 ====="
-curl -fsS "http://127.0.0.1:${PANEL_PORT}/usage" >/dev/null ||
-  die "面板 /usage 页面检查失败，请查看 node-panel 日志。"
-green "面板 HTTP 页面响应正常。"
+USAGE_CODE="$(curl -o /dev/null -s -w '%{http_code}' "http://127.0.0.1:${PANEL_PORT}/usage")" || true
+[[ "$USAGE_CODE" == "200" ]] ||
+  die "面板 /usage 未返回预期的 HTTP 200（实际：${USAGE_CODE:-无响应}），请查看 node-panel 日志。"
+green "面板 /usage 返回 HTTP 200。"
 
 echo
 echo "===== 关键文件与权限检查 ====="
@@ -1435,11 +1691,23 @@ for f in "$XRAY_CONFIG" "$PANEL_FILE" "$PANEL_CONFIG" "$AUTH_FILE" "$SECRET_FILE
   green "存在：$f"
 done
 
-for f in "$AUTH_FILE" "$SECRET_FILE" "$PANEL_CONFIG"; do
+perm="$(stat -c '%a' "$PANEL_CONFIG" 2>/dev/null || echo '?')"
+[[ "$perm" == "600" ]] || die "文件权限异常（应为 600）：$PANEL_CONFIG 当前为 $perm"
+green "权限正常（600）：$PANEL_CONFIG"
+
+# 认证文件：权限、属主、非空、内容必要属性都必须校验。
+for f in "$AUTH_FILE" "$SECRET_FILE"; do
   perm="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"
-  [[ "$perm" == "600" ]] || die "文件权限异常（应为 600）：$f 当前为 $perm"
-  green "权限正常（600）：$f"
+  [[ "$perm" == "600" ]] || die "认证文件权限异常（应为 600）：$f 当前为 $perm"
+  owner="$(stat -c '%U:%G' "$f" 2>/dev/null || echo '?')"
+  [[ "$owner" == "root:root" ]] || die "认证文件属主异常（应为 root:root）：$f 当前为 $owner"
+  [[ -s "$f" ]] || die "认证文件为空：$f"
+  green "认证文件属性正常（600 root:root 非空）：$f"
 done
+
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert all(k in d for k in ("salt","iterations","hash"))' "$AUTH_FILE" ||
+  die "认证文件内容非法（缺少 salt/iterations/hash）：$AUTH_FILE"
+green "认证文件内容有效：$AUTH_FILE"
 
 # ------------------- 输出部署信息 -------------------
 
@@ -1484,9 +1752,17 @@ echo
 yellow "注意：请先将 panel_dual.py 上传到配置的 GitHub 仓库路径，再运行本脚本。"
 
 # 所有检查通过，正式提交安装事务；之后不再自动回滚。
+# 顺序至关重要：必须先成功写入磁盘状态并回读验证，才能关闭自动回滚。
+# 若此处 state_write 失败，INSTALL_COMMITTED 仍为 0，on_exit 会照常触发回滚。
+if ! state_write "COMMITTED" "done"; then
+  die "无法写入 COMMITTED 事务状态，安装未提交，将执行回滚。"
+fi
+COMMITTED_STATUS="$(state_get "$BACKUP_DIR/$STATE_FILE" status)"
+if [[ "$COMMITTED_STATUS" != "COMMITTED" ]]; then
+  die "COMMITTED 状态回读校验失败（实际：${COMMITTED_STATUS:-空}），安装未提交，将执行回滚。"
+fi
 INSTALL_COMMITTED=1
 ROLLBACK_READY=0
-state_write "COMMITTED" "done"
 trap - EXIT INT TERM
 cleanup_temp
 green "安装事务已提交（status=COMMITTED）。备份保留在：$BACKUP_DIR"
