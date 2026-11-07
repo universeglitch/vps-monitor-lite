@@ -314,7 +314,13 @@ BACKUP_DIR="$(mktemp -d "/var/backups/node-panel-install-${STAMP}.XXXXXX")"
 mkdir -p "$BACKUP_DIR/files"
 chmod 700 "$BACKUP_DIR"
 
-for d in "$PANEL_DIR" /etc/node-panel /usr/local/etc/xray; do
+for d in \
+  "$PANEL_DIR" \
+  /etc/node-panel \
+  /usr/local/etc/xray \
+  /etc/systemd/system/xray.service.d \
+  /etc/systemd/system/xray@.service.d
+do
   [[ -d "$d" ]] || TRACK_DIRS+=("$d")
 done
 
