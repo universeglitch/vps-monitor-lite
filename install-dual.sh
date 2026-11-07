@@ -510,7 +510,7 @@ config = {
 }
 
 path = Path(output)
-tmp = path.with_suffix(".new")
+tmp = path.with_name(path.name + ".new")
 tmp.write_text(json.dumps(config, indent=2) + "\n")
 tmp.chmod(0o640)
 tmp.replace(path)
