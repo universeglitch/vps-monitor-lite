@@ -596,7 +596,6 @@ auth_file, secret_file, password_file = sys.argv[1:]
 password = Path(password_file).read_text()
 Path(password_file).unlink(missing_ok=True)
 
-salt = secrets.token_bytes(16)
 os.umask(0o077)
 
 auth_path = Path(auth_file)
