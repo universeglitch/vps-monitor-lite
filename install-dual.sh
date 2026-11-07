@@ -361,7 +361,7 @@ Path(auth_file).write_text(json.dumps({
     "salt": salt.hex(),
     "iterations": iterations,
     "hash": digest
-}) + "\\n")
+}) + "\n")
 Path(secret_file).write_bytes(secrets.token_bytes(32))
 
 os.chmod(auth_file, 0o600)
