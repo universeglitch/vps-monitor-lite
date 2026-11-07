@@ -220,7 +220,10 @@ detect_existing(){
     red "检测到已有 Xray 程序：$xray_bin"
     found=1
   fi
-
+  if pgrep -x xray >/dev/null 2>&1; then
+  red "检测到正在运行的 Xray 进程"
+  found=1
+  fi
   if systemctl cat xray.service >/dev/null 2>&1; then
     red "检测到已有 xray.service"
     found=1
@@ -393,7 +396,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update || die "APT 软件包索引更新失败。"
 
 apt-get install -y --no-install-recommends \
-  ca-certificates curl openssl python3 python3-qrcode python3-pil iproute2 \
+  ca-certificates curl openssl python3 python3-qrcode python3-pil iproute2 procps \
   || die "系统依赖安装失败。"
 # ------------------- 安装前端口占用检查 -------------------
 
