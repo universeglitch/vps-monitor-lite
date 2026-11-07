@@ -156,7 +156,7 @@ trap 'exit 143' TERM
 
 detect_existing(){
   local found=0 item
-    local -a paths=(
+  local -a paths=(
     "$XRAY_CONFIG" "$PANEL_FILE" "$PANEL_CONFIG" "$AUTH_FILE" "$SECRET_FILE"
     "/etc/systemd/system/node-panel.service"
     "/etc/systemd/system/xray.service" "/etc/systemd/system/xray@.service"
@@ -166,43 +166,51 @@ detect_existing(){
     "/etc/systemd/system/xray@.service.d"
     "/var/log/xray"
   )
-    for item in "${paths[@]}"; do
+
+  for item in "${paths[@]}"; do
     if [[ -e "$item" || -L "$item" ]]; then
-      red "检测到已有部署文件：$item"; found=1
+      red "检测到已有部署文件：$item"
+      found=1
     fi
-    done
-    if getent passwd xray >/dev/null 2>&1; then
+  done
+
+  if getent passwd xray >/dev/null 2>&1; then
     red "检测到已有 Xray 用户"
     found=1
-    fi
+  fi
 
-    if getent group xray >/dev/null 2>&1; then
+  if getent group xray >/dev/null 2>&1; then
     red "检测到已有 Xray 用户组"
     found=1
-    fi
-    local xray_bin=""
-    xray_bin="$(command -v xray 2>/dev/null || true)"
+  fi
 
-    for item in /usr/local/bin/xray /usr/bin/xray /usr/local/sbin/xray /usr/sbin/xray; do
+  local xray_bin=""
+  xray_bin="$(command -v xray 2>/dev/null || true)"
+
+  for item in /usr/local/bin/xray /usr/bin/xray /usr/local/sbin/xray /usr/sbin/xray; do
     if [[ -x "$item" ]]; then
-    xray_bin="$item"
-    break
+      xray_bin="$item"
+      break
     fi
-    done
+  done
 
   if [[ -n "$xray_bin" ]]; then
-  red "检测到已有 Xray 程序：$xray_bin"
-  found=1
+    red "检测到已有 Xray 程序：$xray_bin"
+    found=1
   fi
+
   if systemctl cat xray.service >/dev/null 2>&1; then
-    red "检测到已有 xray.service"; found=1
+    red "检测到已有 xray.service"
+    found=1
   fi
+
   if systemctl cat node-panel.service >/dev/null 2>&1; then
-    red "检测到已有 node-panel.service"; found=1
+    red "检测到已有 node-panel.service"
+    found=1
   fi
+
   (( found == 0 )) || die "发现已有 Xray / Node Monitor 部署痕迹。为防止覆盖现有服务，安装已停止。"
 }
-
 [[ $EUID -eq 0 ]] || die "请使用 root 运行。"
 [[ -d /run/systemd/system ]] || die "未检测到 systemd。"
 [[ -f /etc/os-release ]] || die "无法识别系统。"
