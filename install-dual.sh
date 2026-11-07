@@ -155,9 +155,9 @@ rollback_all(){
 
 cleanup_temp(){
   [[ -n "${PASSWORD_FILE:-}" ]] && rm -f -- "$PASSWORD_FILE" 2>/dev/null || true
+  PASSWORD_FILE=""
   unset PANEL_PASSWORD PASSWORD2 REALITY_PRIVATE_KEY KEY_OUTPUT
 }
-
 on_exit(){
   local rc=$?
   trap - EXIT INT TERM
