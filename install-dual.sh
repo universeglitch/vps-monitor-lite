@@ -266,7 +266,7 @@ for p in "$WS_PORT" "$REALITY_PORT" "$PANEL_PORT"; do
 done
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-BACKUP_DIR="/var/backups/node-panel-install-$STAMP"
+BACKUP_DIR="$(mktemp -d "/var/backups/node-panel-install-${STAMP}.XXXXXX")"
 mkdir -p "$BACKUP_DIR/files"
 chmod 700 "$BACKUP_DIR"
 
