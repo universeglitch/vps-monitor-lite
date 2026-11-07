@@ -41,3 +41,6 @@ NOTE:
 The service template assumes the panel runs as root and uses
 /usr/bin/python3. Verify the paths and authentication files
 before restoring on another machine.
+
+#installation
+use install.sh
