@@ -135,8 +135,7 @@ hr{border:0;border-top:1px solid #ffffff18;margin:22px 0}
 <div class="tile"><small>Xray 服务</small><div class="value" id="xray">读取中</div></div>
 <div class="tile"><small>Cloudflare Tunnel 服务</small><div class="value" id="tunnel">读取中</div></div>
 <div class="tile"><small>入口 A · 本地监听</small><div class="value" id="nodeA">读取中</div></div>
-<div class="tile"><small>入口 B · 本地监听</small><div class="value" id="nodeB">读取中</div></div>
-<div class="tile"><small>内存使用</small><div class="value" id="memory">读取中</div></div>
+<div class="tile" id="nodeBTile"><small>入口 B · 本地监听</small><div class="value" id="nodeB">读取中</div></div><div class="tile"><small>内存使用</small><div class="value" id="memory">读取中</div></div>
 </div>
 <hr>
 
@@ -186,7 +185,7 @@ hr{border:0;border-top:1px solid #ffffff18;margin:22px 0}
 <a class="btn secondary" id="downloadWs">下载 WS 配置</a></div>
 <div class="error" id="configErrorWs"></div>
 </div>
-<div class="tile">
+<div class="tile" id="realityTile">
 <h3 style="margin:0 0 12px">节点 B · VLESS + REALITY</h3>
 <div style="text-align:center"><img class="qr" id="qrReality" alt="REALITY 节点二维码"></div>
 <div class="actions"><button id="copyReality">复制 REALITY 分享链接</button>
@@ -215,7 +214,9 @@ async function refresh(){
  try{
   const r=await request('status'),s=await r.json();
   const set=(id,v)=>{$(id).textContent=v?'运行中':'异常';$(id).className='value '+(v?'ok':'bad');};
-  set('xray',s.xray);set('tunnel',s.tunnel);set('nodeA',s.node_a);set('nodeB',s.node_b);
+  set('xray',s.xray);set('tunnel',s.tunnel);set('nodeA',s.node_a);
+ $('nodeBTile').style.display=s.reality_enabled?'':'none';
+ if(s.reality_enabled)set('nodeB',s.node_b);
   $('memory').textContent=s.memory_used+' / '+s.memory_total+' ('+s.memory_percent+'%)';
  }catch(e){}
 }
@@ -241,18 +242,31 @@ async function loadConfig(){
  try{
   const r=await request('config');
   const d=await r.json();
-  for(const kind of ['ws','reality']){
-   const node=d.nodes && d.nodes[kind];
-   if(!node || !node.uri)throw Error('缺少 '+kind+' 节点配置');
-   shareUris[kind]=node.uri;
-   const suffix=kind==='ws'?'Ws':'Reality';
-   $('qr'+suffix).src=endpoint+'?action=qr&node='+kind+'&v='+Date.now();
-   $('download'+suffix).href=endpoint+'?action=download&node='+kind;
-   $('copy'+suffix).onclick=()=>copyNode(kind);
+
+  const ws=d.nodes && d.nodes.ws;
+  if(!ws || !ws.uri)throw Error('缺少 ws 节点配置');
+
+  shareUris.ws=ws.uri;
+  $('qrWs').src=endpoint+'?action=qr&node=ws&v='+Date.now();
+  $('downloadWs').href=endpoint+'?action=download&node=ws';
+  $('copyWs').onclick=()=>copyNode('ws');
+
+  const reality=d.nodes && d.nodes.reality;
+  const realityEnabled=!!(reality && reality.uri);
+
+  $('realityTile').style.display=realityEnabled?'':'none';
+
+  if(realityEnabled){
+   shareUris.reality=reality.uri;
+   $('qrReality').src=endpoint+'?action=qr&node=reality&v='+Date.now();
+   $('downloadReality').href=endpoint+'?action=download&node=reality';
+   $('copyReality').onclick=()=>copyNode('reality');
+  }else{
+   shareUris.reality=null;
   }
+
  }catch(e){
   $('configErrorWs').textContent=e.message;
-  $('configErrorReality').textContent=e.message;
  }
 }
 const browserTargets=[
