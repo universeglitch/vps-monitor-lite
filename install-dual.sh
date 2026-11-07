@@ -589,20 +589,32 @@ password = Path(password_file).read_text()
 Path(password_file).unlink(missing_ok=True)
 
 salt = secrets.token_bytes(16)
+os.umask(0o077)
+
+auth_path = Path(auth_file)
+secret_path = Path(secret_file)
+
+if auth_path.exists():
+    os.chmod(auth_path, 0o600)
+if secret_path.exists():
+    os.chmod(secret_path, 0o600)
+
+salt = secrets.token_bytes(16)
 iterations = 310000
 digest = hashlib.pbkdf2_hmac(
     "sha256", password.encode(), salt, iterations
 ).hex()
 
-Path(auth_file).write_text(json.dumps({
+auth_path.write_text(json.dumps({
     "salt": salt.hex(),
     "iterations": iterations,
     "hash": digest
 }) + "\n")
-Path(secret_file).write_bytes(secrets.token_bytes(32))
 
-os.chmod(auth_file, 0o600)
-os.chmod(secret_file, 0o600)
+secret_path.write_bytes(secrets.token_bytes(32))
+
+os.chmod(auth_path, 0o600)
+os.chmod(secret_path, 0o600)
 PY
 
 rm -f "$PASSWORD_FILE"
