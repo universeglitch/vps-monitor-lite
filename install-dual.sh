@@ -166,34 +166,34 @@ detect_existing(){
     "/etc/systemd/system/xray@.service.d"
     "/var/log/xray"
   )
-  for item in "${paths[@]}"; do
+    for item in "${paths[@]}"; do
     if [[ -e "$item" || -L "$item" ]]; then
       red "检测到已有部署文件：$item"; found=1
     fi
-  done
+    done
     if getent passwd xray >/dev/null 2>&1; then
     red "检测到已有 Xray 用户"
     found=1
-  fi
+    fi
 
-  if getent group xray >/dev/null 2>&1; then
+    if getent group xray >/dev/null 2>&1; then
     red "检测到已有 Xray 用户组"
     found=1
-  fi
-  local xray_bin=""
-  xray_bin="$(command -v xray 2>/dev/null || true)"
+    fi
+    local xray_bin=""
+    xray_bin="$(command -v xray 2>/dev/null || true)"
 
-  for item in /usr/local/bin/xray /usr/bin/xray /usr/local/sbin/xray /usr/sbin/xray; do
-  if [[ -x "$item" ]]; then
+    for item in /usr/local/bin/xray /usr/bin/xray /usr/local/sbin/xray /usr/sbin/xray; do
+    if [[ -x "$item" ]]; then
     xray_bin="$item"
     break
-  fi
-  done
+    fi
+    done
 
-if [[ -n "$xray_bin" ]]; then
+  if [[ -n "$xray_bin" ]]; then
   red "检测到已有 Xray 程序：$xray_bin"
   found=1
-fi
+  fi
   if systemctl cat xray.service >/dev/null 2>&1; then
     red "检测到已有 xray.service"; found=1
   fi
