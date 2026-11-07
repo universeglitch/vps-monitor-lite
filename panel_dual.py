@@ -20,24 +20,53 @@ ALLOWED = re.compile(r"(?i)^/(?:usage|u|admin|ad|a)/?$")
 def load_panel_config():
     if not PANEL_CONFIG.exists():
         raise RuntimeError("缺少 /etc/node-panel/panel-config.json")
+
     cfg = json.loads(PANEL_CONFIG.read_text())
-    ws, reality = cfg.get("ws") or {}, cfg.get("reality") or {}
+
+    ws = cfg.get("ws") or {}
+    reality = cfg.get("reality") or {}
+
+    reality_enabled = cfg.get("reality_enabled", bool(reality))
+    cfg["reality_enabled"] = bool(reality_enabled)
+
     required = {
-        "ws.listen_port": ws.get("listen_port"), "ws.host": ws.get("host"),
-        "ws.port": ws.get("port"), "reality.listen_port": reality.get("listen_port"),
-        "reality.address": reality.get("address"), "reality.port": reality.get("port"),
-        "reality.server_name": reality.get("server_name"),
-        "reality.public_key": reality.get("public_key"), "reality.short_id": reality.get("short_id")
+        "ws.listen_port": ws.get("listen_port"),
+        "ws.host": ws.get("host"),
+        "ws.port": ws.get("port")
     }
+
+    if reality_enabled:
+        required.update({
+            "reality.listen_port": reality.get("listen_port"),
+            "reality.address": reality.get("address"),
+            "reality.port": reality.get("port"),
+            "reality.server_name": reality.get("server_name"),
+            "reality.public_key": reality.get("public_key"),
+            "reality.short_id": reality.get("short_id")
+        })
+
     for name, value in required.items():
         if value is None or str(value).strip() == "":
             raise RuntimeError("panel-config.json 缺少配置项：" + name)
-    for name, value in (("ws.listen_port", ws["listen_port"]), ("ws.port", ws["port"]),
-                        ("reality.listen_port", reality["listen_port"]), ("reality.port", reality["port"])):
+
+    ports = [
+        ("ws.listen_port", ws["listen_port"]),
+        ("ws.port", ws["port"])
+    ]
+
+    if reality_enabled:
+        ports.extend([
+            ("reality.listen_port", reality["listen_port"]),
+            ("reality.port", reality["port"])
+        ])
+
+    for name, value in ports:
         if not str(value).isdigit() or not 1 <= int(value) <= 65535:
             raise RuntimeError("无效端口：" + name)
+
     if not str(ws.get("path", "/")).startswith("/"):
         raise RuntimeError("ws.path 必须以 / 开头")
+
     return cfg
 
 panel_config = load_panel_config()
@@ -396,15 +425,19 @@ def get_status():
     total = mem.get("MemTotal", 0)
     available = mem.get("MemAvailable", 0)
     used = max(0, total - available)
-    return {
+        return {
         "xray": service_active("xray"),
         "tunnel": service_active("cloudflared"),
         "node_a": port_active(int(panel_config["ws"]["listen_port"])),
-        "node_b": port_active(int(panel_config["reality"]["listen_port"])),
+        "node_b": (
+            port_active(int(panel_config["reality"]["listen_port"]))
+            if panel_config["reality_enabled"] else False
+        ),
+        "reality_enabled": panel_config["reality_enabled"],
         "memory_used": str(round(used / 1024)) + " MB",
         "memory_total": str(round(total / 1024)) + " MB",
         "memory_percent": round(used * 100 / total) if total else 0
-    }
+        }
 
 
 def find_vless_inbound(port):
