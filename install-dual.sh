@@ -78,10 +78,32 @@ track_file(){
 }
 
 rollback_all(){
-  local failed=0 i src bak
+  local failed=0 i src bak xray_pids
   yellow "正在回滚本次安装……"
   systemctl stop node-panel.service >/dev/null 2>&1 || true
   systemctl stop xray.service >/dev/null 2>&1 || true
+    # 清理本次安装创建的 Xray 用户和用户组
+  if getent passwd xray >/dev/null 2>&1; then
+    if ! xray_pids="$(ps -u xray -o pid= 2>/dev/null)"; then
+      red "回滚失败：无法检查 Xray 用户进程"
+      failed=1
+    elif [[ -n "${xray_pids//[[:space:]]/}" ]]; then
+      red "回滚失败：Xray 用户仍有进程，不能删除账户"
+      failed=1
+    elif ! userdel xray; then
+      red "回滚失败：无法删除 Xray 用户"
+      failed=1
+    fi
+  fi
+
+  # 仅在 Xray 用户已经不存在时删除同名用户组
+  if ! getent passwd xray >/dev/null 2>&1 &&
+     getent group xray >/dev/null 2>&1; then
+    if ! groupdel xray; then
+      red "回滚失败：无法删除 Xray 用户组"
+      failed=1
+    fi
+  fi
   for ((i=${#TRACK_SRC[@]}-1; i>=0; i--)); do
     src="${TRACK_SRC[$i]}"; bak="${TRACK_BAK[$i]}"
     if [[ -f "$bak.absent" ]]; then
