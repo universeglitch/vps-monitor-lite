@@ -832,7 +832,10 @@ class Handler(BaseHTTPRequestHandler):
         if not ALLOWED.fullmatch(parsed.path):
             self.send_body(404, "Not found")
             return
-        length = min(int(self.headers.get("Content-Length", "0")), 4096)
+        try:
+            length = min(int(self.headers.get("Content-Length", "0")), 4096)
+        except (TypeError, ValueError):
+            length = 0
         form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         action = form.get("action", [""])[0]
 
