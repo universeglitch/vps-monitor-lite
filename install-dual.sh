@@ -315,11 +315,13 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl openssl python3 python3-qrcode python3-pil iproute2
-  for p in "$PANEL_PORT" "$WS_PORT" "$WS_PUBLIC_PORT" "$REALITY_PORT"; do
-  valid_port "$p" || die "端口格式错误：$p"
+# ------------------- 安装前端口占用检查 -------------------
+
+for p in "$WS_PORT" "$REALITY_PORT" "$PANEL_PORT"; do
+  if port_in_use "$p"; then
+    die "端口 $p 已被占用，请更换端口或先处理占用进程。"
+  fi
 done
-
-
 # ------------------- 安装 Xray -------------------
 
 green "[2/8] 安装 Xray"
