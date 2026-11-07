@@ -64,7 +64,9 @@ port_in_use(){
 }
 
 track_file(){
-  local src="$1" rel="$2" dst="$BACKUP_DIR/$rel"
+  local src="$1"
+  local rel="$2"
+  local dst="$BACKUP_DIR/$rel"
   TRACK_SRC+=("$src")
   TRACK_BAK+=("$dst")
   mkdir -p "$(dirname "$dst")"
