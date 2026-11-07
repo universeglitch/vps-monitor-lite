@@ -140,16 +140,65 @@ state_get(){
   printf '%s' "${line#*=}"
 }
 
+# 状态文件必须包含的字段
+STATE_KEYS=(
+  transaction_id created_at updated_at status current_stage
+  xray_was_active xray_was_enabled
+  node_panel_was_active node_panel_was_enabled manifest_complete
+)
+
+# 状态文件合法性状态取值
+STATE_VALUES=(IN_PROGRESS COMMITTED ROLLBACK_IN_PROGRESS ROLLED_BACK ROLLBACK_FAILED NOT_STARTED)
+
+state_status_ok(){
+  local v="$1" s
+  for s in "${STATE_VALUES[@]}"; do [[ "$v" == "$s" ]] && return 0; done
+  return 1
+}
+
+# 校验状态文件：字段齐全（含 manifest_complete 为合法值），可选校验 status / current_stage
+state_verify_fields(){
+  local f="$1" want_status="${2:-}" want_stage="${3:-}" k v
+  [[ -f "$f" ]] || return 1
+  for k in "${STATE_KEYS[@]}"; do
+    grep -q "^${k}=" "$f" || return 1
+  done
+  v="$(state_get "$f" manifest_complete)"
+  [[ "$v" == "0" || "$v" == "1" ]] || return 1
+  [[ -z "$want_status" || "$(state_get "$f" status)" == "$want_status" ]] || return 1
+  [[ -z "$want_stage" || "$(state_get "$f" current_stage)" == "$want_stage" ]] || return 1
+  return 0
+}
+
 # 原子写入事务状态文件（临时文件 + rename），权限 600。
-# 任何一步（写入 / chmod / rename）失败都必须返回非 0 并明确报错，
+# 任何一步（字段检查 / 写入 / chmod / rename / 回读）失败都必须返回非 0 并明确报错，
 # 绝不静默忽略，以免状态文件与实际部署不一致。
 state_write(){
   local status="$1" stage="${2:-$CURRENT_STAGE}"
   CURRENT_STAGE="$stage"
+
+  # 写入前的必需字段检查
   if [[ -z "${BACKUP_DIR:-}" || ! -d "${BACKUP_DIR:-}" ]]; then
     red "错误：事务备份目录不存在，无法写入状态文件（status=$status）。"
     return 1
   fi
+  if [[ -z "${TRANSACTION_ID:-}" ]]; then
+    red "错误：事务 ID 为空，无法写入状态文件。"
+    return 1
+  fi
+  if [[ -z "${CREATED_AT:-}" ]]; then
+    red "错误：事务创建时间为空，无法写入状态文件。"
+    return 1
+  fi
+  if [[ -z "$stage" ]]; then
+    red "错误：当前阶段为空，无法写入状态文件。"
+    return 1
+  fi
+  if ! state_status_ok "$status"; then
+    red "错误：非法的状态取值：${status:-空}"
+    return 1
+  fi
+
   local tmp="$BACKUP_DIR/.state.txt.tmp.$$"
   local target="$BACKUP_DIR/$STATE_FILE"
   if ! {
@@ -173,14 +222,19 @@ state_write(){
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
   fi
-  if ! grep -q "^status=${status}$" "$tmp"; then
-    red "错误：状态临时文件内容校验失败：$tmp"
+  if ! state_verify_fields "$tmp" "$status" "$stage"; then
+    red "错误：状态临时文件字段校验失败：$tmp"
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
   fi
   if ! mv -f -- "$tmp" "$target"; then
     red "错误：无法替换状态文件：$target"
     rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  # rename 后回读验证完整字段，任何缺失/不一致都视为写入失败
+  if ! state_verify_fields "$target" "$status" "$stage"; then
+    red "错误：状态文件回读校验失败：$target"
     return 1
   fi
   return 0
@@ -193,14 +247,32 @@ set_stage(){
   fi
 }
 
-# 文件指纹：MISSING（不存在）/ LINK:<目标>（符号链接）/ sha256:<摘要>
+# 文件指纹：用于判断目标文件是否与事务预期一致（内容 + 类型 + 权限 + 属主）。
+#  - MISSING                               ：路径不存在
+#  - LINK:<目标>|perm=<p>|owner=<u>:<g>     ：符号链接（含链接目标与自身属性）
+#  - DIR:<目录内容摘要>|perm=<p>|owner=<u>:<g> ：目录（含类型与内容状态）
+#  - FILE:<sha256>|perm=<p>|owner=<u>:<g>   ：普通文件
 file_fingerprint(){
-  local f="$1" h
+  local f="$1" perm owner h
   if [[ -L "$f" ]]; then
-    printf 'LINK:%s' "$(readlink -- "$f" 2>/dev/null || echo '?')"
+    perm="$(stat -c '%a' -- "$f" 2>/dev/null || echo '?')"
+    owner="$(stat -c '%U:%G' -- "$f" 2>/dev/null || echo '?')"
+    printf 'LINK:%s|perm=%s|owner=%s' \
+      "$(readlink -- "$f" 2>/dev/null || echo '?')" "$perm" "$owner"
+  elif [[ -d "$f" ]]; then
+    perm="$(stat -c '%a' -- "$f" 2>/dev/null || echo '?')"
+    owner="$(stat -c '%U:%G' -- "$f" 2>/dev/null || echo '?')"
+    # 目录内容状态：直属条目（名称+类型）的稳定摘要
+    h="$(find "$f" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' 2>/dev/null |
+           LC_ALL=C sort | sha256sum 2>/dev/null | awk '{print $1}')" || h=""
+    [[ -n "$h" ]] || h="FAIL"
+    printf 'DIR:%s|perm=%s|owner=%s' "$h" "$perm" "$owner"
   elif [[ -f "$f" ]]; then
-    h="$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')" || true
-    if [[ -n "$h" ]]; then printf 'sha256:%s' "$h"; else printf 'HASHFAIL'; fi
+    perm="$(stat -c '%a' -- "$f" 2>/dev/null || echo '?')"
+    owner="$(stat -c '%U:%G' -- "$f" 2>/dev/null || echo '?')"
+    h="$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')" || h=""
+    [[ -n "$h" ]] || h="FAIL"
+    printf 'FILE:%s|perm=%s|owner=%s' "$h" "$perm" "$owner"
   else
     printf 'MISSING'
   fi
@@ -278,13 +350,29 @@ restore_active(){
   return 0
 }
 
-# 校验服务最终状态是否与安装前一致（active 与 enabled 都要一致）
+# 期望指纹：优先取 hashes.tsv 中记录的事务指纹，回退到清单第四列（安装前指纹）
+expected_fingerprint(){
+  local dir="$1" src="$2" pre="$3" v
+  v="$(hash_of "$dir" "$src")"
+  [[ -n "$v" ]] || v="$pre"
+  printf '%s' "$v"
+}
+
+# 校验服务最终状态是否与安装前一致（active 与 enabled 都要一致）。
+# 服务单元不存在时不能直接判定成功：
+#   - 安装前 active 或 enabled → 单元缺失即恢复失败；
+#   - 安装前既非 active 也非 enabled → 单元缺失才符合预期。
 verify_service_state(){
   local unit="$1" wa="$2" we="$3" ok=1
-  if svc_exists "$unit"; then
-    if [[ "$we" == "1" ]]; then svc_enabled "$unit" || ok=0; else svc_enabled "$unit" && ok=0; fi
-    if [[ "$wa" == "1" ]]; then svc_active "$unit" || ok=0; else svc_active "$unit" && ok=0; fi
+  if ! svc_exists "$unit"; then
+    if [[ "$wa" == "1" || "$we" == "1" ]]; then
+      red "校验失败：$unit 服务单元不存在（安装前 active=$wa enabled=$we）"
+      return 1
+    fi
+    return 0
   fi
+  if [[ "$we" == "1" ]]; then svc_enabled "$unit" || ok=0; else svc_enabled "$unit" && ok=0; fi
+  if [[ "$wa" == "1" ]]; then svc_active "$unit" || ok=0; else svc_active "$unit" && ok=0; fi
   (( ok == 1 ))
 }
 
@@ -303,8 +391,7 @@ verify_recovery_targets(){
     if [[ "$s" != /* || "$s" == *..* ]]; then
       red "校验失败：清单中的路径非法：$s"; failed=1; continue
     fi
-    expected="$(hash_of "$dir" "$s")"
-    [[ -n "$expected" ]] || expected="${pre:-}"
+    expected="$(expected_fingerprint "$dir" "$s" "$pre")"
     if [[ -z "$expected" ]]; then
       red "校验失败：无法确认文件归属（缺少指纹）：$s"; failed=1; continue
     fi
@@ -372,19 +459,32 @@ restore_transaction(){
     fi
   fi
 
-  local -a S=() R=() E=()
-  local s r e
-  while IFS=$'\t' read -r s r e _; do
+  local -a S=() R=() E=() P=()
+  local s r e p
+  while IFS=$'\t' read -r s r e p; do
     [[ -n "${s:-}" ]] || continue
-    S+=("$s"); R+=("$r"); E+=("$e")
+    S+=("$s"); R+=("$r"); E+=("$e"); P+=("${p:-}")
   done < "$manifest"
 
-  local i src rel existed bak
+  local i src rel existed pre expected cur
   for ((i=${#S[@]}-1; i>=0; i--)); do
-    src="${S[$i]}"; rel="${R[$i]}"; existed="${E[$i]}"
+    src="${S[$i]}"; rel="${R[$i]}"; existed="${E[$i]}"; pre="${P[$i]}"
     # 防御：拒绝可疑清单路径，避免误删/误写
     if [[ "$src" != /* || "$src" == *..* || "$rel" == /* || "$rel" == *..* ]]; then
       red "恢复失败：清单路径非法（src=$src rel=$rel）"; failed=1; continue
+    fi
+    # 每个文件实际恢复前再次校验目标指纹：
+    # 若初次检查后目标被外部修改，立即停止后续恢复并保留备份，绝不覆盖。
+    if [[ "$verify" == "1" ]]; then
+      expected="$(expected_fingerprint "$dir" "$src" "$pre")"
+      cur="$(file_fingerprint "$src")"
+      if [[ -n "$expected" && "$cur" != "$expected" ]]; then
+        red "恢复中止：$src 在恢复前被外部修改，停止后续恢复并保留备份。"
+        red "          期望：$expected"
+        red "          实际：$cur"
+        failed=1
+        break
+      fi
     fi
     bak="$dir/$rel"
     if [[ "$existed" == "1" ]]; then
@@ -854,7 +954,7 @@ check_mode(){
 # 恢复模式 --recover
 # =========================================================
 # 校验事务备份是否完整、可自动恢复。任何一项不满足都拒绝恢复：
-#   1) 事务 ID 与状态字段；
+#   1) 事务 ID 与状态字段，且清单必须已标记完整（manifest_complete=1）；
 #   2) 清单路径合法性（禁止信任未经验证的清单路径）；
 #   3) 备份完整性（existed=1 必须有对应备份）；
 #   4) “原本不存在”文件的记录（existed=0 必须有 .absent 标记）。
@@ -867,11 +967,12 @@ verify_transaction(){
   [[ -f "$st" ]] || issues+=("缺少状态文件 state.txt")
   [[ -f "$manifest" ]] || issues+=("缺少事务清单 manifest.tsv")
 
-  # 1) 事务 ID 与状态字段
-  local tid status
+  # 1) 事务 ID 与状态字段 + 清单完整性标记
+  local tid status mc
   if [[ -f "$st" ]]; then
     tid="$(state_get "$st" transaction_id)"
     status="$(state_get "$st" status)"
+    mc="$(state_get "$st" manifest_complete)"
     [[ -n "$tid" ]] || issues+=("状态文件缺少 transaction_id")
     [[ -n "$status" ]] || issues+=("状态文件缺少 status 字段")
     case "$status" in
@@ -880,6 +981,12 @@ verify_transaction(){
     esac
     [[ -z "$tid" || "$tid" == "$(basename "$dir")" ]] ||
       issues+=("事务 ID 与目录名不一致：$tid != $(basename "$dir")")
+    # 清单未标记完整（缺失/为 0/非法）时不得自动恢复，需人工处理
+    case "$mc" in
+      1) ;;
+      0|"") issues+=("事务清单未标记完整（manifest_complete=${mc:-缺失}），拒绝自动恢复") ;;
+      *) issues+=("manifest_complete 取值非法：$mc") ;;
+    esac
   fi
 
   # 2) 清单路径合法性 + 3) 备份完整性 + 4) 原本不存在文件的记录
