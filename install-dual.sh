@@ -149,8 +149,12 @@ on_exit(){
   trap - EXIT INT TERM
   cleanup_temp
   if (( rc != 0 && ROLLBACK_READY == 1 && INSTALL_COMMITTED == 0 )); then
-    rollback_all || true
+  if ! rollback_all; then
+    red "严重警告：安装失败，而且自动回滚未能完全完成！"
+    red "请勿直接重新运行安装脚本。"
+    red "请保留备份目录并检查：$BACKUP_DIR"
   fi
+fi
   exit "$rc"
 }
 
