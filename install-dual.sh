@@ -373,14 +373,21 @@ fi
   die "WS Path 不能包含空格、# 或 ?。"
 echo
 yellow "========== 配置确认 =========="
+if (( REALITY_ENABLED )); then
+  printf '%-25s %s\n' "部署模式：" "VLESS-WS + VLESS-REALITY"
+fi
 printf '%-25s %s\n' "面板监听：" "127.0.0.1:$PANEL_PORT"
 printf '%-25s %s\n' "WS 源站：" "127.0.0.1:$WS_PORT"
 printf '%-25s %s\n' "WS 公网入口：" "$WS_HOST:$WS_PUBLIC_PORT"
 printf '%-25s %s\n' "WS Path：" "$WS_PATH"
-printf '%-25s %s\n' "REALITY 监听：" "0.0.0.0:$REALITY_PORT"
-printf '%-25s %s\n' "REALITY 客户端地址：" "$REALITY_ADDR:$REALITY_PORT"
-printf '%-25s %s\n' "REALITY SNI：" "$REALITY_SNI"
-printf '%-25s %s\n' "REALITY Target：" "$REALITY_TARGET"
+if (( REALITY_ENABLED )); then
+  printf '%-25s %s\n' "REALITY 监听：" "0.0.0.0:$REALITY_PORT"
+  printf '%-25s %s\n' "REALITY 客户端地址：" "$REALITY_ADDR:$REALITY_PORT"
+  printf '%-25s %s\n' "REALITY SNI：" "$REALITY_SNI"
+  printf '%-25s %s\n' "REALITY Target：" "$REALITY_TARGET"
+else
+  printf '%-25s %s\n' "部署模式：" "仅 VLESS-WS"
+fi
 
 echo
 yellow "确认开始安装？输入 YES 继续。"
@@ -456,8 +463,13 @@ apt-get install -y --no-install-recommends \
   ca-certificates curl openssl python3 python3-qrcode python3-pil iproute2 \
   || die "系统依赖安装失败。"
 # ------------------- 安装前端口占用检查 -------------------
+PORTS_TO_CHECK=("$WS_PORT" "$PANEL_PORT")
 
-for p in "$WS_PORT" "$REALITY_PORT" "$PANEL_PORT"; do
+if (( REALITY_ENABLED )); then
+  PORTS_TO_CHECK+=("$REALITY_PORT")
+fi
+
+for p in "${PORTS_TO_CHECK[@]}"; do
   if port_in_use "$p"; then
     die "端口 $p 已被占用，请更换端口或先处理占用进程。"
   fi
@@ -485,84 +497,100 @@ XRAY_BIN="$(command -v xray || true)"
 green "[3/8] 生成节点身份"
 
 WS_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-REALITY_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-REALITY_SHORT_ID="$(openssl rand -hex 8)"
 
-KEY_OUTPUT="$("$XRAY_BIN" x25519 2>&1)" || die "REALITY 密钥生成失败。"
+REALITY_UUID=""
+REALITY_SHORT_ID=""
+REALITY_PRIVATE_KEY=""
+REALITY_PUBLIC_KEY=""
 
-REALITY_PRIVATE_KEY="$(
-  printf '%s\n' "$KEY_OUTPUT" |
-    sed -nE 's/^[[:space:]]*PrivateKey:[[:space:]]*//p' |
-    head -n1
-)"
-REALITY_PUBLIC_KEY="$(
-  printf '%s\n' "$KEY_OUTPUT" |
-    sed -nE 's/^[[:space:]]*(Password \(PublicKey\)|Password|PublicKey):[[:space:]]*//p' |
-    head -n1
-)"
+if (( REALITY_ENABLED )); then
 
-[[ -n "$REALITY_PRIVATE_KEY" ]] || die "未能读取 REALITY 私钥。"
-[[ -n "$REALITY_PUBLIC_KEY" ]] || die "未能读取 REALITY 公钥。"
-unset KEY_OUTPUT
+  REALITY_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  REALITY_SHORT_ID="$(openssl rand -hex 8)"
+
+  KEY_OUTPUT="$("$XRAY_BIN" x25519 2>&1)" || die "REALITY 密钥生成失败。"
+
+  REALITY_PRIVATE_KEY="$(
+    printf '%s\n' "$KEY_OUTPUT" |
+      sed -nE 's/^[[:space:]]*PrivateKey:[[:space:]]*//p' |
+      head -n1
+  )"
+
+  REALITY_PUBLIC_KEY="$(
+    printf '%s\n' "$KEY_OUTPUT" |
+      sed -nE 's/^[[:space:]]*(Password \(PublicKey\)|Password|PublicKey):[[:space:]]*//p' |
+      head -n1
+  )"
+
+  [[ -n "$REALITY_PRIVATE_KEY" ]] || die "未能读取 REALITY 私钥。"
+  [[ -n "$REALITY_PUBLIC_KEY" ]] || die "未能读取 REALITY 公钥。"
+
+  unset KEY_OUTPUT
+
+fi
 
 # ------------------- 生成 Xray 配置 -------------------
 
-green "[4/8] 生成 Xray 双入站配置"
+green "[4/8] 生成 Xray 配置"
 
-python3 - "$XRAY_CONFIG" "$WS_PORT" "$WS_PATH" "$WS_UUID" \
+python3 - "$XRAY_CONFIG" "$REALITY_ENABLED" "$WS_PORT" "$WS_PATH" "$WS_UUID" \
   "$REALITY_PORT" "$REALITY_UUID" "$REALITY_PRIVATE_KEY" \
   "$REALITY_SNI" "$REALITY_TARGET" "$REALITY_SHORT_ID" <<'PY'
 import json, sys
 from pathlib import Path
 
 (
-    output, ws_port, ws_path, ws_uuid,
+    output, reality_enabled, ws_port, ws_path, ws_uuid,
     reality_port, reality_uuid, private_key,
     sni, target, short_id
 ) = sys.argv[1:]
 
-config = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [
-        {
-            "listen": "127.0.0.1",
-            "port": int(ws_port),
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": ws_uuid}],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "ws",
-                "security": "none",
-                "wsSettings": {"path": ws_path}
-            }
+inbounds = [
+    {
+        "listen": "127.0.0.1",
+        "port": int(ws_port),
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": ws_uuid}],
+            "decryption": "none"
         },
-        {
-            "listen": "0.0.0.0",
-            "port": int(reality_port),
-            "protocol": "vless",
-            "settings": {
-                "clients": [{
-                    "id": reality_uuid,
-                    "flow": "xtls-rprx-vision"
-                }],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "raw",
-                "security": "reality",
-                "realitySettings": {
-                    "show": False,
-                    "dest": target,
-                    "xver": 0,
-                    "serverNames": [sni],
-                    "privateKey": private_key,
-                    "shortIds": [short_id]
-                }
+        "streamSettings": {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": ws_path}
+        }
+    }
+]
+
+if reality_enabled == "1":
+    inbounds.append({
+        "listen": "0.0.0.0",
+        "port": int(reality_port),
+        "protocol": "vless",
+        "settings": {
+            "clients": [{
+                "id": reality_uuid,
+                "flow": "xtls-rprx-vision"
+            }],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "raw",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": target,
+                "xver": 0,
+                "serverNames": [sni],
+                "privateKey": private_key,
+                "shortIds": [short_id]
             }
         }
-    ],
+    })
+
+config = {
+    "log": {"loglevel": "warning"},
+    "inbounds": inbounds,
     "outbounds": [
         {"protocol": "freedom", "tag": "direct"},
         {"protocol": "blackhole", "tag": "blocked"}
@@ -577,15 +605,18 @@ tmp.replace(path)
 PY
 
 unset REALITY_PRIVATE_KEY
+
 chown root:xray "$XRAY_CONFIG" ||
   die "无法设置 Xray 配置文件所属用户和用户组。"
+
 chmod 640 "$XRAY_CONFIG"
 
-"$XRAY_BIN" run -test -config "$XRAY_CONFIG" || die "Xray 配置检查失败。"
+"$XRAY_BIN" run -test -config "$XRAY_CONFIG" ||
+  die "Xray 配置检查失败。"
 
-# ------------------- 安装新版双节点面板 -------------------
+# ------------------- 安装新版面板 -------------------
 
-green "[5/8] 安装 Node Monitor 双节点版"
+green "[5/8] 安装 Node Monitor 面板"
 
 curl -fsSL "$PANEL_URL" -o "$PANEL_FILE" ||
   die "下载 panel_dual.py 失败。请确认该文件已上传到 GitHub 仓库指定路径。"
@@ -593,8 +624,9 @@ curl -fsSL "$PANEL_URL" -o "$PANEL_FILE" ||
 grep -q 'PANEL_CONFIG = Path("/etc/node-panel/panel-config.json")' "$PANEL_FILE" ||
   die "下载到的文件不是预期的 panel_dual.py。"
 
-# panel_dual.py 使用嵌套配置结构，和 Xray 入站端口保持一致。
-python3 - "$PANEL_CONFIG" "$PANEL_PORT" \
+# ------------------- 生成面板配置 -------------------
+
+python3 - "$PANEL_CONFIG" "$REALITY_ENABLED" "$PANEL_PORT" \
   "$WS_PORT" "$WS_HOST" "$WS_PUBLIC_PORT" "$WS_PATH" \
   "$REALITY_PORT" "$REALITY_ADDR" "$REALITY_SNI" \
   "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" <<'PY'
@@ -602,7 +634,7 @@ import json, sys
 from pathlib import Path
 
 (
-    output, panel_port,
+    output, reality_enabled, panel_port,
     ws_listen_port, ws_host, ws_port, ws_path,
     reality_listen_port, reality_address, reality_sni,
     reality_public_key, reality_short_id
@@ -610,13 +642,17 @@ from pathlib import Path
 
 cfg = {
     "panel_port": int(panel_port),
+    "reality_enabled": reality_enabled == "1",
     "ws": {
         "listen_port": int(ws_listen_port),
         "host": ws_host,
         "port": int(ws_port),
         "path": ws_path
-    },
-    "reality": {
+    }
+}
+
+if reality_enabled == "1":
+    cfg["reality"] = {
         "listen_port": int(reality_listen_port),
         "address": reality_address,
         "port": int(reality_listen_port),
@@ -627,7 +663,6 @@ cfg = {
         "network": "tcp",
         "flow": "xtls-rprx-vision"
     }
-}
 
 path = Path(output)
 tmp = path.with_name(path.name + ".new")
@@ -637,6 +672,7 @@ tmp.replace(path)
 PY
 
 chmod 600 "$PANEL_CONFIG"
+
 python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$PANEL_FILE" ||
   die "面板 Python 语法检查失败。"
 
