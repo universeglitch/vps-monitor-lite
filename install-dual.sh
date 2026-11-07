@@ -126,7 +126,11 @@ BACKUP_DIR=""
 TRANSACTION_ID=""
 CREATED_AT=""
 CURRENT_STAGE=""
+# MANIFEST_COMPLETE：备份清单（含安装前指纹）是否已完整写入
 MANIFEST_COMPLETE=0
+# HASHES_COMPLETE：是否已把所有受管文件的“安装后指纹”写入 hashes.tsv
+# 两者语义不同，严禁混用：安装中途中断时 MANIFEST_COMPLETE=1 但 HASHES_COMPLETE=0。
+HASHES_COMPLETE=0
 PASSWORD_FILE=""
 declare -a TRACK_DIRS=()
 
@@ -144,7 +148,8 @@ state_get(){
 STATE_KEYS=(
   transaction_id created_at updated_at status current_stage
   xray_was_active xray_was_enabled
-  node_panel_was_active node_panel_was_enabled manifest_complete
+  node_panel_was_active node_panel_was_enabled
+  manifest_complete hashes_complete
 )
 
 # 状态文件合法性状态取值
@@ -156,15 +161,25 @@ state_status_ok(){
   return 1
 }
 
-# 校验状态文件：字段齐全（含 manifest_complete 为合法值），可选校验 status / current_stage
+# 尽力把文件刷入磁盘，降低断电丢失状态/指纹的风险（失败不影响主流程）
+fsync_path(){
+  local f="$1"
+  [[ -e "$f" ]] || return 0
+  command sync -f "$f" 2>/dev/null || command sync 2>/dev/null || true
+  return 0
+}
+
+# 校验状态文件：字段齐全（manifest_complete / hashes_complete 均为合法值），可选校验 status / current_stage
 state_verify_fields(){
   local f="$1" want_status="${2:-}" want_stage="${3:-}" k v
   [[ -f "$f" ]] || return 1
   for k in "${STATE_KEYS[@]}"; do
     grep -q "^${k}=" "$f" || return 1
   done
-  v="$(state_get "$f" manifest_complete)"
-  [[ "$v" == "0" || "$v" == "1" ]] || return 1
+  for k in manifest_complete hashes_complete; do
+    v="$(state_get "$f" "$k")"
+    [[ "$v" == "0" || "$v" == "1" ]] || return 1
+  done
   [[ -z "$want_status" || "$(state_get "$f" status)" == "$want_status" ]] || return 1
   [[ -z "$want_stage" || "$(state_get "$f" current_stage)" == "$want_stage" ]] || return 1
   return 0
@@ -212,11 +227,13 @@ state_write(){
     printf 'node_panel_was_active=%s\n' "${NODEPANEL_WAS_ACTIVE:-0}"
     printf 'node_panel_was_enabled=%s\n' "${NODEPANEL_WAS_ENABLED:-0}"
     printf 'manifest_complete=%s\n' "${MANIFEST_COMPLETE:-0}"
+    printf 'hashes_complete=%s\n' "${HASHES_COMPLETE:-0}"
   } > "$tmp"; then
     red "错误：无法写入状态临时文件：$tmp"
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
   fi
+  fsync_path "$tmp"
   if ! chmod 600 "$tmp"; then
     red "错误：无法设置状态文件权限（应为 600）：$tmp"
     rm -f -- "$tmp" 2>/dev/null || true
@@ -232,6 +249,7 @@ state_write(){
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
   fi
+  fsync_path "$target"
   # rename 后回读验证完整字段，任何缺失/不一致都视为写入失败
   if ! state_verify_fields "$target" "$status" "$stage"; then
     red "错误：状态文件回读校验失败：$target"
@@ -240,8 +258,13 @@ state_write(){
   return 0
 }
 
-# 阶段推进：状态写入失败必须阻止安装继续
+# 阶段推进：状态写入失败必须阻止安装继续。
+# 进入新阶段前，先把上一阶段结束时的受管文件“安装后指纹”持久化，
+# 这样即使在这之后（下一阶段内）被 SIGKILL，已发生的改动都有可验证依据。
 set_stage(){
+  if [[ "${MANIFEST_COMPLETE:-0}" == "1" && -n "${BACKUP_DIR:-}" ]]; then
+    record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE" || true
+  fi
   if ! state_write "IN_PROGRESS" "$1"; then
     die "无法更新安装状态（阶段：$1），安装中止。"
   fi
@@ -297,14 +320,20 @@ track_file(){
   printf '%s\t%s\t%s\t%s\n' "$src" "$rel" "$existed" "$pre" >> "$BACKUP_DIR/$MANIFEST_FILE"
 }
 
-# 记录某文件当前的“事务指纹”（追加写入 hashes.tsv，同路径以最后一条为准）
+# 记录某文件当前的“安装后指纹”，持久化追加写入 hashes.tsv。
+# 每行：<路径>\t<指纹>\tpost，同路径以最后一条为准。
+# 追加后立即 fsync，确保安装中途 SIGKILL / 断电时该记录仍可读。
 record_hash(){
   local src="$1"
   [[ -n "${BACKUP_DIR:-}" && -d "${BACKUP_DIR:-}" ]] || return 0
-  printf '%s\t%s\n' "$src" "$(file_fingerprint "$src")" >> "$BACKUP_DIR/$HASH_FILE"
+  local j="$BACKUP_DIR/$HASH_FILE"
+  printf '%s\t%s\tpost\n' "$src" "$(file_fingerprint "$src")" >> "$j" || return 1
+  fsync_path "$j"
 }
 
-# 为清单中所有受管文件记录当前指纹
+# 为清单中所有受管文件记录当前“安装后指纹”。
+# 在安装的每个阶段边界以及受管文件被外部安装器改写之后调用，
+# 以尽量缩小子进程被强杀时“已改动但无记录”的窗口。
 record_manifest_hashes(){
   local manifest="$1"
   [[ -f "$manifest" ]] || return 0
@@ -350,12 +379,55 @@ restore_active(){
   return 0
 }
 
-# 期望指纹：优先取 hashes.tsv 中记录的事务指纹，回退到清单第四列（安装前指纹）
-expected_fingerprint(){
-  local dir="$1" src="$2" pre="$3" v
-  v="$(hash_of "$dir" "$src")"
-  [[ -n "$v" ]] || v="$pre"
-  printf '%s' "$v"
+# 判断目标文件是否处于“事务预期状态”，返回：
+#   0 = 与已记录的安装后指纹一致，或（无安装后指纹但）与安装前指纹一致 → 可安全恢复
+#   1 = 与已记录的安装后指纹不一致 → 疑似被外部修改，禁止覆盖
+#   2 = 既无安装后指纹、又与安装前指纹不一致 → 归属未知，保守拒绝（不猜测）
+check_recovery_target(){
+  local dir="$1" src="$2" pre="$3" post cur
+  post="$(hash_of "$dir" "$src")"
+  cur="$(file_fingerprint "$src")"
+  if [[ -n "$post" ]]; then
+    [[ "$cur" == "$post" ]] && return 0
+    return 1
+  fi
+  [[ "$cur" == "$pre" ]] && return 0
+  return 2
+}
+
+# 根据返回值输出可读的失败原因
+report_recovery_target_issue(){
+  local rc="$1" src="$2"
+  if [[ "$rc" == "1" ]]; then
+    red "校验失败：$src 与已记录的安装后指纹不一致（可能被外部修改），禁止覆盖。"
+  else
+    red "校验失败：$src 既无安装后指纹、又与安装前状态不一致（归属未知），保守拒绝恢复。"
+  fi
+}
+
+# 恢复前校验：目标文件必须与事务预期一致，否则停止恢复（绝不覆盖外部修改，
+# 也绝不猜测归属未知的文件）。仅用于 --recover（无法信任进程内状态）。
+verify_recovery_targets(){
+  local dir="$1"
+  local manifest="$dir/$MANIFEST_FILE"
+  local failed=0 s r e pre rc
+  if [[ ! -f "$manifest" ]]; then
+    red "缺少事务清单，无法校验恢复目标：$manifest"
+    return 1
+  fi
+  while IFS=$'\t' read -r s r e pre; do
+    [[ -n "${s:-}" ]] || continue
+    if [[ "$s" != /* || "$s" == *..* ]]; then
+      red "校验失败：清单中的路径非法：$s"; failed=1; continue
+    fi
+    rc=0
+    check_recovery_target "$dir" "$s" "$pre" || rc=$?
+    if (( rc != 0 )); then
+      report_recovery_target_issue "$rc" "$s"
+      failed=1
+    fi
+  done < "$manifest"
+  (( failed == 0 ))
 }
 
 # 校验服务最终状态是否与安装前一致（active 与 enabled 都要一致）。
@@ -374,36 +446,6 @@ verify_service_state(){
   if [[ "$we" == "1" ]]; then svc_enabled "$unit" || ok=0; else svc_enabled "$unit" && ok=0; fi
   if [[ "$wa" == "1" ]]; then svc_active "$unit" || ok=0; else svc_active "$unit" && ok=0; fi
   (( ok == 1 ))
-}
-
-# 恢复前校验：目标文件必须与事务预期一致，否则停止恢复（绝不覆盖外部修改）。
-# 仅用于 --recover（在新 Shell 中独立运行，无法信任进程内状态）。
-verify_recovery_targets(){
-  local dir="$1"
-  local manifest="$dir/$MANIFEST_FILE"
-  local failed=0 s r e pre expected cur
-  if [[ ! -f "$manifest" ]]; then
-    red "缺少事务清单，无法校验恢复目标：$manifest"
-    return 1
-  fi
-  while IFS=$'\t' read -r s r e pre; do
-    [[ -n "${s:-}" ]] || continue
-    if [[ "$s" != /* || "$s" == *..* ]]; then
-      red "校验失败：清单中的路径非法：$s"; failed=1; continue
-    fi
-    expected="$(expected_fingerprint "$dir" "$s" "$pre")"
-    if [[ -z "$expected" ]]; then
-      red "校验失败：无法确认文件归属（缺少指纹）：$s"; failed=1; continue
-    fi
-    cur="$(file_fingerprint "$s")"
-    if [[ "$cur" != "$expected" ]]; then
-      red "校验失败：目标文件与事务预期不一致（可能被外部修改）：$s"
-      red "          期望：$expected"
-      red "          实际：$cur"
-      failed=1
-    fi
-  done < "$manifest"
-  (( failed == 0 ))
 }
 
 # 按事务清单恢复（供自动回滚与 --recover 共用）。
@@ -466,7 +508,7 @@ restore_transaction(){
     S+=("$s"); R+=("$r"); E+=("$e"); P+=("${p:-}")
   done < "$manifest"
 
-  local i src rel existed pre expected cur
+  local i src rel existed pre rc
   for ((i=${#S[@]}-1; i>=0; i--)); do
     src="${S[$i]}"; rel="${R[$i]}"; existed="${E[$i]}"; pre="${P[$i]}"
     # 防御：拒绝可疑清单路径，避免误删/误写
@@ -474,14 +516,17 @@ restore_transaction(){
       red "恢复失败：清单路径非法（src=$src rel=$rel）"; failed=1; continue
     fi
     # 每个文件实际恢复前再次校验目标指纹：
-    # 若初次检查后目标被外部修改，立即停止后续恢复并保留备份，绝不覆盖。
+    # 若初次检查后目标被外部修改（或被改动后无记录、归属未知），
+    # 立即停止后续恢复并保留备份，绝不覆盖。
     if [[ "$verify" == "1" ]]; then
-      expected="$(expected_fingerprint "$dir" "$src" "$pre")"
-      cur="$(file_fingerprint "$src")"
-      if [[ -n "$expected" && "$cur" != "$expected" ]]; then
-        red "恢复中止：$src 在恢复前被外部修改，停止后续恢复并保留备份。"
-        red "          期望：$expected"
-        red "          实际：$cur"
+      rc=0
+      check_recovery_target "$dir" "$src" "$pre" || rc=$?
+      if (( rc != 0 )); then
+        if (( rc == 1 )); then
+          red "恢复中止：$src 在恢复前被外部修改，停止后续恢复并保留备份。"
+        else
+          red "恢复中止：$src 无安装后指纹且与安装前不一致（归属未知），保守拒绝恢复。"
+        fi
         failed=1
         break
       fi
@@ -1075,6 +1120,8 @@ recover_mode(){
   echo "创建时间：$(state_get "$st" created_at)"
   echo "安装前服务状态：xray(active=$(state_get "$st" xray_was_active), enabled=$(state_get "$st" xray_was_enabled)) "
   echo "                  node-panel(active=$(state_get "$st" node_panel_was_active), enabled=$(state_get "$st" node_panel_was_enabled))"
+  echo "清单完整(manifest_complete)=$(state_get "$st" manifest_complete)  安装后指纹已记录(hashes_complete)=$(state_get "$st" hashes_complete)"
+  echo "（指纹未记录完整时，恢复会对已改动但无记录的文件保守拒绝，不会猜测其归属。）"
   echo
 
   echo "正在校验备份完整性……"
@@ -1103,6 +1150,7 @@ recover_mode(){
   CREATED_AT="$(state_get "$st" created_at)"
   CURRENT_STAGE="recover"
   MANIFEST_COMPLETE="$(state_get "$st" manifest_complete)"
+  HASHES_COMPLETE="$(state_get "$st" hashes_complete)"
   XRAY_WAS_ACTIVE="$(state_get "$st" xray_was_active)"
   XRAY_WAS_ENABLED="$(state_get "$st" xray_was_enabled)"
   NODEPANEL_WAS_ACTIVE="$(state_get "$st" node_panel_was_active)"
@@ -1441,6 +1489,10 @@ if ! command -v xray >/dev/null 2>&1; then
     die "Xray 安装失败。"
 fi
 
+# 官方安装器会改写受管文件（/usr/local/bin/xray、xray.service 等）。
+# 立即持久化这些文件的安装后指纹，避免此处被强杀后无法判定其归属。
+record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE" || true
+
 XRAY_BIN="$(command -v xray || true)"
 [[ -x "$XRAY_BIN" ]] || XRAY_BIN="/usr/local/bin/xray"
 [[ -x "$XRAY_BIN" ]] || die "找不到 Xray。"
@@ -1747,8 +1799,12 @@ systemctl enable --now node-panel
 set_stage "8/8 最终检查"
 green "[8/8] 最终检查"
 
-# 所有受管文件均已就位，刷新事务指纹，确保 --recover 校验覆盖全部清单条目
+# 所有受管文件均已就位，刷新安装后指纹，确保 --recover 校验覆盖全部清单条目。
 record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE"
+# 全部安装后指纹已记录，显式标记（与“备份清单完整”MANIFEST_COMPLETE 区分）。
+HASHES_COMPLETE=1
+state_write "IN_PROGRESS" "8/8 最终检查" ||
+  red "警告：无法写入 hashes_complete 标记（继续最终检查）。"
 
 "$XRAY_BIN" run -test -config "$XRAY_CONFIG" ||
   die "Xray 最终配置检查失败。"

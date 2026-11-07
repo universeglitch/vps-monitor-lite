@@ -37,7 +37,7 @@ sed -n "1,$((LINE-1))p" "$SRC" > "$WORK/lib.sh"
 # shellcheck disable=SC1091
 lib(){ set --; source "$WORK/lib.sh" >/dev/null 2>&1; set +e; }
 
-write_state(){ # write_state <dir> <status> <manifest_complete>
+write_state(){ # write_state <dir> <status> <manifest_complete> [hashes_complete]
   cat > "$1/state.txt" <<EOF
 transaction_id=$(basename "$1")
 created_at=2026-01-01T00:00:00Z
@@ -49,6 +49,7 @@ xray_was_enabled=0
 node_panel_was_active=0
 node_panel_was_enabled=0
 manifest_complete=$3
+hashes_complete=${4:-0}
 EOF
 }
 
@@ -248,6 +249,156 @@ test_restore_ok_control(){
 }
 
 # =========================================================
+# T7 安装中途修改部分受管文件后立即中断 → 新 Shell --recover 安全恢复
+#   a：安装前已存在，安装中被改写，且已记录安装后指纹（post 与当前一致）
+#   b：安装前已存在，安装中未改动（无 post 记录，当前 == 安装前）
+#   c：安装前不存在，安装中新建，且已记录安装后指纹
+#   模拟安装中途（hashes_complete=0）被 SIGKILL，新 Shell 独立恢复应成功。
+# =========================================================
+test_interrupted_install_recover(){
+  echo "T7 安装中途中断（部分已改并已记录指纹）→ --recover 安全恢复"
+  lib
+  stub_no_units
+  local d="$WORK/t7" a="$WORK/t7-a" b="$WORK/t7-b" c="$WORK/t7-c"
+  mkdir -p "$d/files"
+
+  # 安装前状态
+  printf 'A-orig' > "$a"
+  printf 'B-orig' > "$b"
+  local preA preB
+  preA="$(file_fingerprint "$a")"
+  preB="$(file_fingerprint "$b")"
+
+  # 备份（安装前快照）
+  cp -a "$a" "$d/files/fa"
+  cp -a "$b" "$d/files/fb"
+  : > "$d/files/fc.absent"
+
+  # 安装过程：a 被改写、c 被新建（均按设计在写入后立即记录 post 指纹）
+  printf 'A-installed' > "$a"
+  printf 'C-installed' > "$c"
+  local postA postC
+  postA="$(file_fingerprint "$a")"
+  postC="$(file_fingerprint "$c")"
+  {
+    printf '%s\t%s\tpost\n' "$a" "$postA"
+    printf '%s\t%s\tpost\n' "$c" "$postC"
+  } > "$d/hashes.tsv"
+
+  # b 未改动 → 无 post 记录
+  {
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$preA"
+    printf '%s\t%s\t%s\t%s\n' "$b" "files/fb" 1 "$preB"
+    printf '%s\t%s\t%s\t%s\n' "$c" "files/fc" 0 "MISSING"
+  } > "$d/manifest.tsv"
+
+  write_state "$d" IN_PROGRESS 1 0   # 清单完整，但指纹未记录完整（中断）
+
+  expect_ok "清单完整，备份校验通过" verify_transaction "$d"
+  expect_ok "安装后指纹与当前一致 → 目标校验通过" verify_recovery_targets "$d"
+  expect_ok "新 Shell 独立恢复成功" restore_transaction "$d" 1
+
+  if [[ "$(cat "$a")" == "A-orig" ]]; then ok "已改文件 a 还原为安装前内容"; else no "a 未还原（$(cat "$a" 2>/dev/null)）"; fi
+  if [[ "$(cat "$b")" == "B-orig" ]]; then ok "未改文件 b 保持安装前内容"; else no "b 被破坏"; fi
+  if [[ ! -e "$c" ]]; then ok "新建文件 c 被删除"; else no "c 未被删除"; fi
+}
+
+# =========================================================
+# T8 安装中断后，某文件在记录 post 指纹之后又被外部修改 → 拒绝恢复且不覆盖
+# =========================================================
+test_interrupted_then_external_modify(){
+  echo "T8 中断后又遭外部修改 → 拒绝恢复且不覆盖"
+  lib
+  stub_no_units
+  local d="$WORK/t8" a="$WORK/t8-a"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"
+  local preA; preA="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+
+  # 安装改写 a，并记录 post
+  printf 'A-installed' > "$a"
+  printf '%s\t%s\tpost\n' "$a" "$(file_fingerprint "$a")" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$preA" > "$d/manifest.tsv"
+
+  # 外部修改（与已记录的 post 不一致）
+  printf 'A-external' > "$a"
+
+  expect "与已记录安装后指纹不一致 → 拒绝" verify_recovery_targets "$d"
+  expect "恢复被拒绝" restore_transaction "$d" 1
+  if [[ "$(cat "$a")" == "A-external" ]]; then ok "外部修改未被覆盖"; else no "外部修改被覆盖（$(cat "$a")）"; fi
+}
+
+# =========================================================
+# T9 已改动但无 post 记录且与安装前不一致 → 归属未知，保守拒绝（不猜测）
+#   同时验证未改动文件（当前 == 安装前）仍可判定为安全。
+# =========================================================
+test_unrecorded_change_conservative(){
+  echo "T9 已改动但无指纹记录 → 归属未知，保守拒绝"
+  lib
+  stub_no_units
+  local d="$WORK/t9" a="$WORK/t9-a" b="$WORK/t9-b"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"
+  printf 'B-orig' > "$b"
+  local preA preB
+  preA="$(file_fingerprint "$a")"
+  preB="$(file_fingerprint "$b")"
+  cp -a "$a" "$d/files/fa"
+  cp -a "$b" "$d/files/fb"
+
+  # a 被改动但未记录 post（模拟写入后、记录前被强杀）
+  printf 'A-changed' > "$a"
+  # b 未改动
+  : > "$d/hashes.tsv"
+
+  {
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$preA"
+    printf '%s\t%s\t%s\t%s\n' "$b" "files/fb" 1 "$preB"
+  } > "$d/manifest.tsv"
+
+  expect "缺 post 且与安装前不一致 → 拒绝" verify_recovery_targets "$d"
+  expect "恢复被拒绝" restore_transaction "$d" 1
+  if [[ "$(cat "$a")" == "A-changed" ]]; then ok "归属未知文件未被覆盖"; else no "归属未知文件被覆盖"; fi
+
+  # 仅保留未改动文件时，应判定为安全（当前 == 安装前）
+  printf '%s\t%s\t%s\t%s\n' "$b" "files/fb" 1 "$preB" > "$d/manifest.tsv"
+  expect_ok "未改动文件（当前==安装前）判定为安全" verify_recovery_targets "$d"
+}
+
+# =========================================================
+# T10 state_write 持久化 / 校验 hashes_complete（与 manifest_complete 区分）
+# =========================================================
+test_hashes_complete_flag(){
+  echo "T10 hashes_complete 标记持久化与校验"
+  lib
+  BACKUP_DIR="$WORK/t10"; mkdir -p "$BACKUP_DIR"
+  TRANSACTION_ID="t10"; CREATED_AT="2026-01-01T00:00:00Z"
+  MANIFEST_COMPLETE=1; HASHES_COMPLETE=0
+  expect_ok "写入（清单完整、指纹未记录）成功" state_write IN_PROGRESS init
+  if [[ "$(state_get "$BACKUP_DIR/state.txt" manifest_complete)" == "1" &&
+        "$(state_get "$BACKUP_DIR/state.txt" hashes_complete)" == "0" ]]; then
+    ok "两标记分别持久化：manifest_complete=1 / hashes_complete=0"
+  else
+    no "标记持久化不正确"
+  fi
+
+  HASHES_COMPLETE=1
+  expect_ok "写入（指纹记录完整）成功" state_write IN_PROGRESS init
+  if [[ "$(state_get "$BACKUP_DIR/state.txt" hashes_complete)" == "1" ]]; then
+    ok "hashes_complete=1 已持久化"
+  else
+    no "hashes_complete=1 未持久化"
+  fi
+
+  # hashes_complete 缺失 / 非法 → 回读校验必须失败
+  sed '/^hashes_complete=/d' "$BACKUP_DIR/state.txt" > "$WORK/t10-missing"
+  expect "缺少 hashes_complete 回读校验失败" state_verify_fields "$WORK/t10-missing"
+  sed 's/^hashes_complete=.*/hashes_complete=7/' "$BACKUP_DIR/state.txt" > "$WORK/t10-bad"
+  expect "hashes_complete 非法回读校验失败" state_verify_fields "$WORK/t10-bad"
+}
+
+# =========================================================
 echo "=================================================="
 echo " install-dual.sh 恢复安全机制测试"
 echo "=================================================="
@@ -259,6 +410,10 @@ test_owner_change
 test_symlink_change
 test_change_between_check_and_restore
 test_restore_ok_control
+test_interrupted_install_recover
+test_interrupted_then_external_modify
+test_unrecorded_change_conservative
+test_hashes_complete_flag
 echo "--------------------------------------------------"
 printf '结果：\033[32m%d 通过\033[0m，\033[31m%d 失败\033[0m\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
