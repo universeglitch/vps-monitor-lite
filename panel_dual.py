@@ -762,7 +762,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_body(200, json.dumps(get_status()), "application/json")
             elif action == "visitor":
                 self.send_body(
-                    200
+                    200,
                     json.dumps(get_visitor_info(self), ensure_ascii=False),
                     "application/json"
                 )
@@ -788,10 +788,16 @@ class Handler(BaseHTTPRequestHandler):
             )
             elif action in ("qr", "download"):
                 node = parse_qs(parsed.query).get("node", ["ws"])[0].lower()
-                if node not in ("ws", "reality"):
-                    self.send_body(400, "Invalid node")
-                    return
-                uri = get_uris()[node]
+
+            if node not in ("ws", "reality"):
+            self.send_body(400, "Invalid node")
+            return
+
+            if node == "reality" and not panel_config["reality_enabled"]:
+            self.send_body(404, "Reality node is not enabled")
+            return
+
+    uri = get_uris()[node]
                 if action == "qr":
                     img = qrcode.make(uri)
                     buf = BytesIO()
