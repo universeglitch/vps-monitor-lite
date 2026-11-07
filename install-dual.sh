@@ -288,38 +288,89 @@ WS_HOST="$(ask "WS 客户端连接域名（Cloudflare 橙云域名）")"
 WS_PUBLIC_PORT="$(ask "WS 客户端连接端口" "443")"
 WS_PATH="$(ask "WS Path（留空自动生成）" "")"
 
-yellow "【3】REALITY 设置"
+yellow "【3】部署模式"
 
-REALITY_PORT="$(ask "REALITY 监听端口" "10086")"
-REALITY_ADDR="$(ask "REALITY 客户端连接地址（公网 IPv4 或域名）")"
-REALITY_SNI="$(ask "REALITY SNI / serverName")"
-REALITY_TARGET="$(ask "REALITY dest / target（例如 example.com:443）")"
+REALITY_ENABLED=0
+
+echo "1. VLESS-WS + VLESS-REALITY"
+echo "2. 仅部署 VLESS-WS（默认）"
+
+while true; do
+  read -r -p "请选择部署模式 [2]: " DEPLOY_MODE
+  DEPLOY_MODE="${DEPLOY_MODE:-2}"
+
+  case "$DEPLOY_MODE" in
+    1)
+      REALITY_ENABLED=1
+      break
+      ;;
+    2)
+      REALITY_ENABLED=0
+      break
+      ;;
+    *)
+      yellow "请输入 1 或 2。"
+      ;;
+  esac
+done
+
+# 预先初始化，避免 set -u 导致变量未定义
+REALITY_PORT=""
+REALITY_ADDR=""
+REALITY_SNI=""
+REALITY_TARGET=""
+
+if (( REALITY_ENABLED )); then
+  yellow "【4】REALITY 设置"
+
+  REALITY_PORT="$(ask "REALITY 监听端口" "10086")"
+  REALITY_ADDR="$(ask "REALITY 客户端连接地址（公网 IPv4 或域名）")"
+  REALITY_SNI="$(ask "REALITY SNI / serverName")"
+  REALITY_TARGET="$(ask "REALITY dest / target（例如 example.com:443）")"
+fi
 
 # ------------------- 参数验证 -------------------
 
-for p in "$PANEL_PORT" "$WS_PORT" "$WS_PUBLIC_PORT" "$REALITY_PORT"; do
+for p in "$PANEL_PORT" "$WS_PORT" "$WS_PUBLIC_PORT"; do
   valid_port "$p" || die "端口格式错误：$p"
 done
 
 [[ "$PANEL_PORT" != "$WS_PORT" ]] || die "面板端口和 WS 端口不能相同。"
-[[ "$PANEL_PORT" != "$REALITY_PORT" ]] || die "面板端口和 REALITY 端口不能相同。"
-[[ "$WS_PORT" != "$REALITY_PORT" ]] || die "WS 和 REALITY 端口不能相同。"
 
 valid_host "$WS_HOST" || die "WS 域名格式错误。"
-valid_host "$REALITY_ADDR" || die "REALITY 地址格式错误（当前脚本不支持 IPv6）。"
-valid_host "$REALITY_SNI" || die "REALITY SNI 格式错误。"
 
-[[ "$REALITY_TARGET" =~ ^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]{1,5})$ ]] ||
-  die "REALITY target 格式错误，应为 hostname:port。"
-TARGET_PORT="${BASH_REMATCH[3]}"
-valid_port "$TARGET_PORT" || die "REALITY target 端口必须在 1–65535 之间。"
+if (( REALITY_ENABLED )); then
+
+  valid_port "$REALITY_PORT" || die "REALITY 端口格式错误。"
+
+  [[ "$PANEL_PORT" != "$REALITY_PORT" ]] ||
+    die "面板端口和 REALITY 端口不能相同。"
+
+  [[ "$WS_PORT" != "$REALITY_PORT" ]] ||
+    die "WS 和 REALITY 端口不能相同。"
+
+  valid_host "$REALITY_ADDR" ||
+    die "REALITY 地址格式错误（当前脚本不支持 IPv6）。"
+
+  valid_host "$REALITY_SNI" ||
+    die "REALITY SNI 格式错误。"
+
+  [[ "$REALITY_TARGET" =~ ^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]{1,5})$ ]] ||
+    die "REALITY target 格式错误，应为 hostname:port。"
+
+  TARGET_PORT="${BASH_REMATCH[3]}"
+  valid_port "$TARGET_PORT" ||
+    die "REALITY target 端口必须在 1–65535 之间。"
+
+fi
 
 if [[ -z "$WS_PATH" ]]; then
   WS_PATH="/$(openssl rand -hex 16)"
 fi
-[[ "$WS_PATH" == /* ]] || die "WS Path 必须以 / 开头。"
-[[ "$WS_PATH" != *[[:space:]\#\?]* ]] || die "WS Path 不能包含空格、# 或 ?。"
 
+[[ "$WS_PATH" == /* ]] || die "WS Path 必须以 / 开头。"
+[[ "$WS_PATH" != *[[:space:]\#\?]* ]] ||
+  die "WS Path 不能包含空格、# 或 ?。"
 echo
 yellow "========== 配置确认 =========="
 printf '%-25s %s\n' "面板监听：" "127.0.0.1:$PANEL_PORT"
