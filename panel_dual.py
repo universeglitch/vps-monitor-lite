@@ -439,7 +439,7 @@ def get_status():
     total = mem.get("MemTotal", 0)
     available = mem.get("MemAvailable", 0)
     used = max(0, total - available)
-        return {
+    return {
         "xray": service_active("xray"),
         "tunnel": service_active("cloudflared"),
         "node_a": port_active(int(panel_config["ws"]["listen_port"])),
@@ -451,7 +451,7 @@ def get_status():
         "memory_used": str(round(used / 1024)) + " MB",
         "memory_total": str(round(total / 1024)) + " MB",
         "memory_percent": round(used * 100 / total) if total else 0
-        }
+    }
 
 
 def find_vless_inbound(port):
@@ -787,31 +787,31 @@ class Handler(BaseHTTPRequestHandler):
                     "application/json"
                 )
             elif action == "config":
-            uris = get_uris()
-            nodes = {
-            "ws": {"uri": uris["ws"]}
-             }
+                uris = get_uris()
+                nodes = {
+                    "ws": {"uri": uris["ws"]}
+                }
 
-            if panel_config["reality_enabled"]:
-            nodes["reality"] = {"uri": uris["reality"]}
+                if panel_config["reality_enabled"]:
+                    nodes["reality"] = {"uri": uris["reality"]}
 
-            self.send_body(
-            200,
-            json.dumps({"nodes": nodes}, ensure_ascii=False),
-            "application/json"
-            )
+                self.send_body(
+                    200,
+                    json.dumps({"nodes": nodes}, ensure_ascii=False),
+                    "application/json"
+                )
             elif action in ("qr", "download"):
                 node = parse_qs(parsed.query).get("node", ["ws"])[0].lower()
 
-            if node not in ("ws", "reality"):
-            self.send_body(400, "Invalid node")
-            return
+                if node not in ("ws", "reality"):
+                    self.send_body(400, "Invalid node")
+                    return
 
-            if node == "reality" and not panel_config["reality_enabled"]:
-            self.send_body(404, "Reality node is not enabled")
-            return
+                if node == "reality" and not panel_config["reality_enabled"]:
+                    self.send_body(404, "Reality node is not enabled")
+                    return
 
-    uri = get_uris()[node]
+                uri = get_uris()[node]
                 if action == "qr":
                     img = qrcode.make(uri)
                     buf = BytesIO()
