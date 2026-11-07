@@ -517,7 +517,8 @@ tmp.replace(path)
 PY
 
 unset REALITY_PRIVATE_KEY
-chown root:xray "$XRAY_CONFIG" 2>/dev/null || true
+chown root:xray "$XRAY_CONFIG" ||
+  die "无法设置 Xray 配置文件所属用户和用户组。"
 chmod 640 "$XRAY_CONFIG"
 
 "$XRAY_BIN" run -test -config "$XRAY_CONFIG" || die "Xray 配置检查失败。"
