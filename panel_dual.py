@@ -762,7 +762,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_body(200, json.dumps(get_status()), "application/json")
             elif action == "visitor":
                 self.send_body(
-                    200,
+                    200
                     json.dumps(get_visitor_info(self), ensure_ascii=False),
                     "application/json"
                 )
@@ -773,11 +773,19 @@ class Handler(BaseHTTPRequestHandler):
                     "application/json"
                 )
             elif action == "config":
-                uris = get_uris()
-                self.send_body(200, json.dumps({"nodes": {
-                    "ws": {"uri": uris["ws"]},
-                    "reality": {"uri": uris["reality"]}
-                }}, ensure_ascii=False), "application/json")
+            uris = get_uris()
+            nodes = {
+            "ws": {"uri": uris["ws"]}
+             }
+
+            if panel_config["reality_enabled"]:
+            nodes["reality"] = {"uri": uris["reality"]}
+
+            self.send_body(
+            200,
+            json.dumps({"nodes": nodes}, ensure_ascii=False),
+            "application/json"
+            )
             elif action in ("qr", "download"):
                 node = parse_qs(parsed.query).get("node", ["ws"])[0].lower()
                 if node not in ("ws", "reality"):
