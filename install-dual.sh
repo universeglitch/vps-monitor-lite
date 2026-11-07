@@ -80,13 +80,13 @@ track_file(){
 rollback_all(){
   local failed=0 i src bak
   yellow "正在回滚本次安装……"
-    if [[ "$NODEPANEL_WAS_ACTIVE" == "1" ]]; then
+  if [[ "$NODEPANEL_WAS_ACTIVE" == "1" ]]; then
     systemctl stop node-panel.service >/dev/null 2>&1 || true
-    fi
+  fi
 
-    if [[ "$XRAY_WAS_ACTIVE" == "1" ]]; then
+  if [[ "$XRAY_WAS_ACTIVE" == "1" ]]; then
     systemctl stop xray.service >/dev/null 2>&1 || true
-    fi
+  fi
   for ((i=${#TRACK_SRC[@]}-1; i>=0; i--)); do
     src="${TRACK_SRC[$i]}"; bak="${TRACK_BAK[$i]}"
     if [[ -f "$bak.absent" ]]; then
