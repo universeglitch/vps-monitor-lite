@@ -315,6 +315,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl openssl python3 python3-qrcode python3-pil iproute2
+  for p in "$PANEL_PORT" "$WS_PORT" "$WS_PUBLIC_PORT" "$REALITY_PORT"; do
+  valid_port "$p" || die "端口格式错误：$p"
+done
+
 
 # ------------------- 安装 Xray -------------------
 
