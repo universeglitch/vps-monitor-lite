@@ -504,8 +504,8 @@ config = {
 }
 
 path = Path(output)
-tmp = path.with_suffix(".json.new")
 tmp.write_text(json.dumps(config, indent=2) + "\n")
+tmp.chmod(0o640)
 tmp.replace(path)
 PY
 
