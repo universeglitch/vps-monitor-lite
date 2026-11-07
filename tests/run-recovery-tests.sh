@@ -7,6 +7,9 @@
 # 在隔离的临时目录中直接调用恢复/校验函数，不触碰真实系统状态。
 #
 # shellcheck disable=SC2034  # 部分变量由被 source 的函数库消费
+# SC2317：打桩函数（svc_*/systemctl/state_write 等）由被 source 的函数库间接调用，
+# ShellCheck 无法静态追踪，故在此文件级忽略该 info 级提示。
+# shellcheck disable=SC2317
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -63,6 +66,42 @@ stub_no_units(){
   ps(){ return 0; }
   userdel(){ return 0; }
   groupdel(){ return 0; }
+}
+
+# 打桩：node-panel 服务由本事务管理（清单包含其单元），stop 失败
+stub_panel_stop_fail(){
+  svc_exists(){ return 0; }
+  svc_active(){ return 1; }
+  svc_enabled(){ return 1; }
+  systemctl(){ return 1; }
+}
+
+# 打桩：node-panel 服务由本事务管理，stop “成功”但服务仍 active
+stub_panel_still_active(){
+  svc_exists(){ return 0; }
+  svc_active(){ return 0; }
+  svc_enabled(){ return 1; }
+  systemctl(){ return 0; }
+}
+
+# 打桩：node-panel 服务由本事务管理，stop 成功但 disable 失败
+stub_panel_disable_fail(){
+  svc_exists(){ return 0; }
+  svc_active(){ return 1; }
+  svc_enabled(){ return 1; }
+  systemctl(){ case "$1" in stop) return 0 ;; disable) return 1 ;; *) return 0 ;; esac; }
+}
+
+# 打桩：模拟 restore_transaction 成功、但 ROLLED_BACK 状态写入失败
+stub_rolled_back_write_fail(){
+  restore_transaction(){ return 0; }
+  state_write(){ [[ "$1" == "ROLLED_BACK" ]] && return 1; return 0; }
+}
+
+# 打桩：模拟 restore_transaction 失败、且 ROLLBACK_FAILED 状态写入失败
+stub_rollback_failed_write_fail(){
+  restore_transaction(){ return 1; }
+  state_write(){ [[ "$1" == "ROLLBACK_FAILED" ]] && return 1; return 0; }
 }
 
 expect_content(){ # expect_content <描述> <文件> <期望内容>
@@ -270,8 +309,9 @@ test_restore_ok_control(){
     ok "目标与预期不一致时拒绝恢复"
   fi
 
-  # 目标与预期一致时应当恢复成功
-  printf 'orig' > "$f"
+  # 目标与预期一致时应当恢复成功。
+  # 用 cp -a 从备份还原，忠实模拟原子替换后的状态：内容、权限、属主与 mtime 均与安装后一致。
+  cp -a "$d/files/f" "$f"
   expect_ok "目标与预期一致时恢复成功" restore_transaction "$d" 1
   if [[ "$(cat "$f")" == "orig" ]]; then ok "恢复内容正确"; else no "恢复内容错误"; fi
 }
@@ -506,9 +546,11 @@ test_interrupt_before_atomic_replace(){
   printf '%s\t%s\tpost\n' "$a" "$post" > "$d/hashes.tsv"
   printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre" > "$d/manifest.tsv"
   write_state "$d" ROLLBACK_IN_PROGRESS 1 1
-  # 模拟：已持久化恢复意图，但正式替换尚未发生，且遗留半截临时文件
+  # 当前事务 ID：临时文件按事务 ID 归属，清理仅限本事务
+  TRANSACTION_ID="t12txn"
+  # 模拟：已持久化恢复意图，但正式替换尚未发生，且遗留下本事务的半截临时文件
   expect_ok "写入 INTENT 日志" journal_set "$d" "$a" RESTORE INTENT "$pre" "$post"
-  printf 'partial-temp' > "$(dirname "$a")/.node-panel-restore.12345.6789"
+  printf 'partial-temp' > "$(dirname "$a")/.node-panel-restore.$TRANSACTION_ID.6789"
 
   expect_ok "再次恢复安全重试成功" restore_transaction "$d" 1
   expect_content "目标恢复为安装前内容" "$a" "A-orig"
@@ -539,8 +581,9 @@ test_interrupt_after_replace_before_journal(){
   printf '%s\t%s\tpost\n' "$a" "$post" > "$d/hashes.tsv"
   printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre" > "$d/manifest.tsv"
   write_state "$d" ROLLBACK_IN_PROGRESS 1 1
-  # 正式目标已恢复为安装前内容，但恢复日志仍停留在 INTENT
-  printf 'A-orig' > "$a"
+  # 正式目标已恢复为安装前状态（内容、权限、属主与 mtime 均与安装前一致），
+  # 但恢复日志仍停留在 INTENT。用 cp -a 忠实模拟原子替换完成后的状态。
+  cp -a "$d/files/fa" "$a"
   expect_ok "写入 INTENT 日志" journal_set "$d" "$a" RESTORE INTENT "$pre" "$post"
   # 若错误地重跑替换会调用 restore_one_file；令其失败以证明未重跑
   restore_one_file(){ return 9; }
@@ -578,8 +621,8 @@ test_external_modify_during_recovery(){
     printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$preA"
   } > "$d/manifest.tsv"
   write_state "$d" ROLLBACK_IN_PROGRESS 1 1
-  # A 已成功恢复（内容==安装前 + 日志 RESTORED）
-  printf 'A-orig' > "$a"
+  # A 已成功恢复（内容/权限/属主/mtime 均与安装前一致 + 日志 RESTORED）
+  cp -a "$d/files/fa" "$a"
   expect_ok "写入 A 为 RESTORED" journal_set "$d" "$a" RESTORE RESTORED "$preA" "$postA"
   # B 被外部修改（既非安装前、也非已记录的安装后指纹）
   printf 'B-external' > "$b"
@@ -714,6 +757,346 @@ test_nonexistent_removal_interrupt(){
 }
 
 # =========================================================
+# T19 临时文件清理仅限本事务：只删除本事务自己的普通临时文件
+#     其他事务 / 其他程序创建的同前缀文件、目录、符号链接及其目标都必须保留
+# =========================================================
+test_temp_cleanup_scope(){
+  echo "T19 临时文件清理仅限本事务"
+  lib
+  local d="$WORK/t19" td="$WORK/t19-d"; mkdir -p "$d/files" "$td"
+  local a="$td/a"
+  printf 'orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'installed' > "$a"
+
+  TRANSACTION_ID="t19txn"
+  # 本事务遗留的临时普通文件 → 应被清理
+  printf 'own-temp' > "$td/.node-panel-restore.$TRANSACTION_ID.111"
+  # 其他事务遗留的临时文件 → 必须保留
+  printf 'other-txn' > "$td/.node-panel-restore.othertxn.222"
+  # 其他程序创建的同前缀文件（不含事务 ID）→ 必须保留
+  printf 'other-prog' > "$td/.node-panel-restore.manual-notes"
+  # 本事务前缀的目录 → 不得删除目录
+  mkdir -p "$td/.node-panel-restore.$TRANSACTION_ID.dir"
+  # 本事务前缀的符号链接及其目标 → 不得删除
+  printf 'link-target' > "$WORK/t19-linktarget"
+  ln -s "$WORK/t19-linktarget" "$td/.node-panel-restore.$TRANSACTION_ID.link"
+
+  expect_ok "本事务恢复成功" restore_one_file "$d" "$a" "files/fa" "$pre"
+  expect_content "目标恢复为安装前内容" "$a" "orig"
+  expect_file_absent "本事务遗留临时文件已清理" "$td/.node-panel-restore.$TRANSACTION_ID.111"
+  expect_file_present "其他事务临时文件保留" "$td/.node-panel-restore.othertxn.222"
+  expect_file_present "其他程序同前缀文件保留" "$td/.node-panel-restore.manual-notes"
+  expect_file_present "本事务前缀目录保留（不删目录）" "$td/.node-panel-restore.$TRANSACTION_ID.dir"
+  expect_file_present "本事务前缀符号链接保留" "$td/.node-panel-restore.$TRANSACTION_ID.link"
+  expect_file_present "符号链接目标未被删除" "$WORK/t19-linktarget"
+}
+
+# =========================================================
+# T20 service 停止失败 → 立即中止文件恢复，不覆盖运行中服务的配置
+# =========================================================
+test_stop_failure_aborts(){
+  echo "T20 systemctl stop 失败 → 中止文件恢复"
+  lib
+  local d="$WORK/t20" td="$WORK/t20-d"; mkdir -p "$d/files" "$td"
+  local a="$td/panel.conf"
+  printf 'orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'installed' > "$a"
+  printf '%s\t%s\tpost\n' "$a" "$(file_fingerprint "$a")" > "$d/hashes.tsv"
+  {
+    printf '%s\t%s\t%s\t%s\n' "$NODE_PANEL_UNIT" "files/u" 0 "MISSING"
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre"
+  } > "$d/manifest.tsv"
+  : > "$d/files/u.absent"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  stub_panel_stop_fail   # stop 失败
+
+  expect "stop 失败 → 恢复中止（非 0）" restore_transaction "$d" 1
+  expect_content "停止失败时目标文件未被恢复" "$a" "installed"
+}
+
+# =========================================================
+# T21 停止后服务仍 active → 立即中止文件恢复
+# =========================================================
+test_still_active_aborts(){
+  echo "T21 停止后仍 active → 中止文件恢复"
+  lib
+  local d="$WORK/t21" td="$WORK/t21-d"; mkdir -p "$d/files" "$td"
+  local a="$td/panel.conf"
+  printf 'orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'installed' > "$a"
+  printf '%s\t%s\tpost\n' "$a" "$(file_fingerprint "$a")" > "$d/hashes.tsv"
+  {
+    printf '%s\t%s\t%s\t%s\n' "$NODE_PANEL_UNIT" "files/u" 0 "MISSING"
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre"
+  } > "$d/manifest.tsv"
+  : > "$d/files/u.absent"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  stub_panel_still_active   # stop “成功”但服务仍 active
+
+  expect "停止后仍 active → 恢复中止（非 0）" restore_transaction "$d" 1
+  expect_content "仍 active 时目标文件未被恢复" "$a" "installed"
+}
+
+# =========================================================
+# T22 systemctl disable 失败 → 必须明确中止（不得静默忽略）
+# =========================================================
+test_disable_failure_aborts(){
+  echo "T22 systemctl disable 失败 → 中止文件恢复"
+  lib
+  local d="$WORK/t22" td="$WORK/t22-d"; mkdir -p "$d/files" "$td"
+  local a="$td/panel.conf"
+  printf 'orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'installed' > "$a"
+  printf '%s\t%s\tpost\n' "$a" "$(file_fingerprint "$a")" > "$d/hashes.tsv"
+  {
+    printf '%s\t%s\t%s\t%s\n' "$NODE_PANEL_UNIT" "files/u" 0 "MISSING"
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre"
+  } > "$d/manifest.tsv"
+  : > "$d/files/u.absent"
+  # 安装前 node-panel 未启用（ne=0）→ 恢复需 disable；令 disable 失败
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  stub_panel_disable_fail
+
+  expect "disable 失败 → 恢复中止（非 0）" restore_transaction "$d" 1
+  expect_content "disable 失败时目标文件未被恢复" "$a" "installed"
+}
+
+# =========================================================
+# T23 最终状态 ROLLED_BACK 写入失败 → 返回非 0 且明确报告持久化失败
+# =========================================================
+test_rolled_back_write_failure(){
+  echo "T23 ROLLED_BACK 写入失败 → 返回非 0 并明确报告"
+  lib
+  local d="$WORK/t23"; mkdir -p "$d"
+  BACKUP_DIR="$d"
+  stub_rolled_back_write_fail
+  local out rc=0
+  out="$(rollback_all 2>&1)" || rc=$?
+  if (( rc != 0 )); then ok "ROLLED_BACK 写入失败 → 返回非 0"; else no "ROLLED_BACK 写入失败却返回 0"; fi
+  if [[ "$out" == *"无法持久化 ROLLED_BACK"* ]]; then ok "明确报告 ROLLED_BACK 持久化失败"; else no "未明确报告 ROLLED_BACK 持久化失败"; fi
+  if [[ "$out" == *"回滚完成"* ]]; then no "写入失败却仍报告回滚成功"; else ok "未误报回滚成功"; fi
+}
+
+# =========================================================
+# T24 ROLLBACK_FAILED 自身写入失败 → 返回非 0 且明确报告状态持久化失败
+# =========================================================
+test_rollback_failed_write_failure(){
+  echo "T24 ROLLBACK_FAILED 写入失败 → 返回非 0 并明确报告"
+  lib
+  local d="$WORK/t24"; mkdir -p "$d"
+  BACKUP_DIR="$d"
+  stub_rollback_failed_write_fail
+  local out rc=0
+  out="$(rollback_all 2>&1)" || rc=$?
+  if (( rc != 0 )); then ok "ROLLBACK_FAILED 写入失败 → 返回非 0"; else no "ROLLBACK_FAILED 写入失败却返回 0"; fi
+  if [[ "$out" == *"无法持久化 ROLLBACK_FAILED"* ]]; then ok "明确报告 ROLLBACK_FAILED 持久化失败"; else no "未明确报告 ROLLBACK_FAILED 持久化失败"; fi
+}
+
+# =========================================================
+# 恢复日志（restore-journal.tsv）校验：构造最小合法事务
+#   a：安装前存在，需 RESTORE；备份 files/fa；已记录安装后指纹
+#   设置全局 JH_A / JH_PRE / JH_POST 供各用例引用
+# =========================================================
+build_journal_case(){
+  local d="$1"
+  mkdir -p "$d/files"
+  JH_A="$d/a"
+  printf 'orig' > "$JH_A"
+  JH_PRE="$(file_fingerprint "$JH_A")"
+  cp -a "$JH_A" "$d/files/fa"
+  printf 'installed' > "$JH_A"
+  JH_POST="$(file_fingerprint "$JH_A")"
+  printf '%s\t%s\tpost\n' "$JH_A" "$JH_POST" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$JH_A" "files/fa" 1 "$JH_PRE" > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+}
+
+# =========================================================
+# T25 journal 列数错误 → 拒绝恢复
+# =========================================================
+test_journal_bad_column_count(){
+  echo "T25 journal 列数错误 → 拒绝恢复"
+  lib
+  stub_no_units
+  local d="$WORK/t25"; build_journal_case "$d"
+  # 合法日志先通过（对照）
+  printf '1\t%s\tRESTORE\tPENDING\t%s\t%s\n' "$JH_A" "$JH_PRE" "$JH_POST" > "$d/restore-journal.tsv"
+  expect_ok "合法六列日志通过校验" verify_restore_journal "$d"
+
+  # 只有五列（缺安装后指纹）→ 拒绝
+  printf '1\t%s\tRESTORE\tPENDING\t%s\n' "$JH_A" "$JH_PRE" > "$d/restore-journal.tsv"
+  expect "journal 列数错误 → verify_restore_journal 拒绝" verify_restore_journal "$d"
+  expect "journal 列数错误 → 恢复被拒绝" restore_transaction "$d" 1
+  expect_content "拒绝恢复时目标未被改动" "$JH_A" "installed"
+}
+
+# =========================================================
+# T26 journal 路径重复 → 拒绝恢复
+# =========================================================
+test_journal_duplicate_path(){
+  echo "T26 journal 路径重复 → 拒绝恢复"
+  lib
+  local d="$WORK/t26"; build_journal_case "$d"
+  {
+    printf '1\t%s\tRESTORE\tPENDING\t%s\t%s\n' "$JH_A" "$JH_PRE" "$JH_POST"
+    printf '1\t%s\tRESTORE\tPENDING\t%s\t%s\n' "$JH_A" "$JH_PRE" "$JH_POST"
+  } > "$d/restore-journal.tsv"
+  expect "journal 路径重复 → 拒绝" verify_restore_journal "$d"
+}
+
+# =========================================================
+# T27 journal action 与 manifest 不一致 → 拒绝恢复
+# =========================================================
+test_journal_action_mismatch(){
+  echo "T27 journal action 与 manifest 不一致 → 拒绝恢复"
+  lib
+  local d="$WORK/t27"; build_journal_case "$d"
+  # 清单记录 a 安装前存在（existed=1），日志却要求 REMOVE → 矛盾
+  printf '1\t%s\tREMOVE\tPENDING\t%s\t%s\n' "$JH_A" "$JH_PRE" "$JH_POST" > "$d/restore-journal.tsv"
+  expect "action 与清单不一致 → 拒绝" verify_restore_journal "$d"
+}
+
+# =========================================================
+# T28 journal 版本/状态/动作/指纹不一致 → 拒绝恢复
+# =========================================================
+test_journal_field_mismatch(){
+  echo "T28 journal 字段非法或不一致 → 拒绝恢复"
+  lib
+  local d="$WORK/t28"; build_journal_case "$d"
+
+  printf '2\t%s\tRESTORE\tPENDING\t%s\t%s\n' "$JH_A" "$JH_PRE" "$JH_POST" > "$d/restore-journal.tsv"
+  expect "版本非法 → 拒绝" verify_restore_journal "$d"
+
+  printf '1\t%s\tRESTORE\tBOGUS\t%s\t%s\n' "$JH_A" "$JH_PRE" "$JH_POST" > "$d/restore-journal.tsv"
+  expect "状态非法 → 拒绝" verify_restore_journal "$d"
+
+  printf '1\t%s\tFOO\tPENDING\t%s\t%s\n' "$JH_A" "$JH_PRE" "$JH_POST" > "$d/restore-journal.tsv"
+  expect "动作非法 → 拒绝" verify_restore_journal "$d"
+
+  printf '1\t%s\tRESTORE\tPENDING\t%s\t%s\n' "$JH_A" "FILE:deadbeef|perm=644|owner=root:root" "$JH_POST" > "$d/restore-journal.tsv"
+  expect "pre 与清单指纹不一致 → 拒绝" verify_restore_journal "$d"
+
+  printf '1\t%s\tRESTORE\tPENDING\t%s\t%s\n' "$JH_A" "$JH_PRE" "FILE:cafebabe|perm=644|owner=root:root" > "$d/restore-journal.tsv"
+  expect "post 与 hashes.tsv 不一致 → 拒绝" verify_restore_journal "$d"
+}
+
+# =========================================================
+# T29 manifest 路径重复 / 备份路径映射冲突 → 拒绝恢复
+# =========================================================
+test_manifest_duplicate_path(){
+  echo "T29 manifest 重复路径与映射冲突 → 拒绝恢复"
+  lib
+  # 场景 a：src 重复
+  local d="$WORK/t29"; mkdir -p "$d/files"
+  local a="$d/a"; printf 'orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"; cp -a "$a" "$d/files/fa2"
+  {
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa"  1 "$pre"
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa2" 1 "$pre"
+  } > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  expect "manifest 重复 src → verify_transaction 拒绝" verify_transaction "$d"
+
+  # 场景 b：rel 映射冲突（两条记录指向同一备份路径，其余因素完全一致）
+  lib
+  local d2="$WORK/t29b"; mkdir -p "$d2/files"
+  local x="$d2/x"
+  printf 'same' > "$x"
+  cp -a "$x" "$d2/y"        # 内容/mtime/权限一致 → 指纹相同
+  cp -a "$x" "$d2/files/bak"
+  local fpx; fpx="$(file_fingerprint "$x")"
+  {
+    printf '%s\t%s\t%s\t%s\n' "$x" "files/bak" 1 "$fpx"
+    printf '%s\t%s\t%s\t%s\n' "$d2/y" "files/bak" 1 "$fpx"
+  } > "$d2/manifest.tsv"
+  write_state "$d2" ROLLBACK_IN_PROGRESS 1 1
+  expect "备份路径映射冲突（rel 重复）→ 拒绝" verify_transaction "$d2"
+}
+
+# =========================================================
+# T30 hashes.tsv 矛盾记录 / 字段数量错误 → 拒绝；同一路径多条 post → 接受
+# =========================================================
+test_hashes_contradiction(){
+  echo "T30 hashes.tsv 矛盾记录 → 拒绝恢复"
+  lib
+  local d="$WORK/t30"; mkdir -p "$d/files"
+  local a="$d/a"; printf 'orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'installed' > "$a"
+  local post; post="$(file_fingerprint "$a")"
+  printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre" > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+
+  # 同一路径出现不同标记（post 与 pre）→ 相互矛盾
+  {
+    printf '%s\t%s\tpost\n' "$a" "$post"
+    printf '%s\t%s\tpre\n'  "$a" "FILE:deadbeef|perm=644|owner=root:root|mtime=1.0"
+  } > "$d/hashes.tsv"
+  expect "同一路径矛盾记录 → 拒绝" verify_transaction "$d"
+
+  # 字段数量错误（缺少标记列）
+  printf '%s\t%s\n' "$a" "$post" > "$d/hashes.tsv"
+  expect "hashes.tsv 字段数量错误 → 拒绝" verify_transaction "$d"
+
+  # 同一路径多条 post（安装流程合法追加，以最后一条为准）→ 接受
+  {
+    printf '%s\t%s\tpost\n' "$a" "FILE:1111|perm=644|owner=root:root|mtime=1.0"
+    printf '%s\t%s\tpost\n' "$a" "$post"
+  } > "$d/hashes.tsv"
+  expect_ok "同一路径多条 post → 接受（以最后一条为准）" verify_transaction "$d"
+}
+
+# =========================================================
+# T31 mtime 变化按新规则处理 + 旧格式指纹兼容
+# =========================================================
+test_mtime_change(){
+  echo "T31 mtime 校验与旧格式兼容"
+  lib
+  local old="FILE:abc|perm=644|owner=root:root"
+  local new="FILE:abc|perm=644|owner=root:root|mtime=123.000000000"
+  local newer="FILE:abc|perm=644|owner=root:root|mtime=999.000000000"
+  expect_ok "旧格式（无 mtime）与含 mtime 指纹兼容相等" fp_equal "$old" "$new"
+  expect "mtime 不同 → 判定不相等" fp_equal "$new" "$newer"
+
+  # 端到端：内容不变、仅 mtime 变化 → 拒绝恢复
+  local d="$WORK/t31" a="$WORK/t31-a"
+  mkdir -p "$d/files"
+  printf 'content' > "$a"
+  cp -a "$a" "$d/files/fa"
+  local fp; fp="$(file_fingerprint "$a")"
+  printf '%s\t%s\tpost\n' "$a" "$fp" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$fp" > "$d/manifest.tsv"
+  expect_ok "指纹一致时校验通过" verify_recovery_targets "$d"
+  touch -d '2001-01-01 00:00:00' "$a"
+  expect "仅 mtime 变化 → 拒绝恢复" verify_recovery_targets "$d"
+}
+
+# =========================================================
+# T32 特殊文件类型（FIFO）→ 指纹标注 SPECIAL、拒绝自动恢复、不误删
+# =========================================================
+test_special_file_rejected(){
+  echo "T32 特殊文件类型安全拒绝"
+  lib
+  local d="$WORK/t32" td="$WORK/t32-d"; mkdir -p "$d/files" "$td"
+  local fifo="$td/pipe"
+  if ! mkfifo "$fifo" 2>/dev/null; then echo "  跳过（无法创建 FIFO）"; return; fi
+  local fp; fp="$(file_fingerprint "$fifo")"
+  if [[ "$fp" == SPECIAL:* ]]; then ok "特殊文件类型指纹标注 SPECIAL（不误判 MISSING）"; else no "特殊文件类型指纹错误（$fp）"; fi
+  expect "restore_one_file 拒绝特殊文件类型" restore_one_file "$d" "$fifo" "files/pipe" "$fp"
+  if [[ -p "$fifo" ]]; then ok "特殊文件未被误删"; else no "特殊文件被误删/修改"; fi
+}
+
+# =========================================================
 echo "=================================================="
 echo " install-dual.sh 恢复安全机制测试"
 echo "=================================================="
@@ -737,6 +1120,20 @@ test_corrupt_backup
 test_backup_perm_changed
 test_persistence_failure
 test_nonexistent_removal_interrupt
+test_temp_cleanup_scope
+test_stop_failure_aborts
+test_still_active_aborts
+test_disable_failure_aborts
+test_rolled_back_write_failure
+test_rollback_failed_write_failure
+test_journal_bad_column_count
+test_journal_duplicate_path
+test_journal_action_mismatch
+test_journal_field_mismatch
+test_manifest_duplicate_path
+test_hashes_contradiction
+test_mtime_change
+test_special_file_rejected
 echo "--------------------------------------------------"
 printf '结果：\033[32m%d 通过\033[0m，\033[31m%d 失败\033[0m\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

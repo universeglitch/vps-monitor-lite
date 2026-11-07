@@ -183,6 +183,18 @@ meta.txt       记录 Xray 用户/用户组安装前是否存在
 files/         被备份的文件副本
 ```
 
+文件指纹覆盖文件类型、内容、权限、属主/属组与纳秒级修改时间（mtime）：
+
+```text
+FILE:<sha256>|perm=<p>|owner=<u>:<g>|mtime=<m>    普通文件
+LINK:<目标>|perm=<p>|owner=<u>:<g>|mtime=<m>      符号链接（只校验链接自身，不跟随链接）
+DIR:<内容摘要>|perm=<p>|owner=<u>:<g>|mtime=<m>   目录
+SPECIAL:<类型>|perm=<p>|owner=<u>:<g>|mtime=<m>   FIFO/socket/设备等特殊类型（恢复时明确拒绝自动替换）
+MISSING                                          路径不存在
+```
+
+为兼容本次改动之前创建的历史事务（其指纹不含 mtime），比较指纹时若任一方缺少 mtime 字段，则忽略 mtime、仅比较其余属性。
+
 其中 manifest_complete 与 hashes_complete 是两个独立标记，含义不同，不能混用：
 
 ```text
@@ -261,12 +273,14 @@ bash install-dual.sh --recover   # 再恢复
 
 - 扫描 /var/backups/node-panel-install-*，列出状态为 IN_PROGRESS / ROLLBACK_IN_PROGRESS / ROLLBACK_FAILED 的事务，并显示创建时间、失败阶段、备份目录
 - 校验备份完整性：逐项核对每个备份的类型、内容、权限、属主/属组与清单记录的安装前指纹是否一致（不只是判断“文件是否存在”）；任何一项损坏都会拒绝恢复，并明确报告是哪一个备份损坏
+- 恢复前先校验清单与恢复日志：核对 manifest.tsv 与 hashes.tsv 的字段数量、路径去重、路径合法性与指纹格式，并逐条校验 restore-journal.tsv（必须恰好六列、版本合法、路径不重复、动作只能是 RESTORE/REMOVE、状态合法、RESTORE/REMOVE 与清单中安装前是否存在一致、pre 指纹与清单一致、post 指纹与 hashes.tsv 一致）；只要发现日志被损坏、截断或字段不完整，一律拒绝恢复，绝不猜测文件状态
 - 列出安装前服务状态，供你确认
 - 需要你选择事务编号并显式输入 yes 确认后才执行
 - 按该事务的清单恢复文件；只恢复清单中记录的文件，只删除清单中记录为“安装前不存在”的文件，并保留权限、属主、时间戳、符号链接属性
 - 每个文件先写入并持久化恢复意图（INTENT），再以“同文件系统临时文件 + 原子替换”的方式还原，绝不把备份直接复制到正式路径（避免中断留下半截文件）；符号链接按链接本身还原，不跟随链接覆盖
 - 恢复服务的启用/运行状态（依据 state.txt 记录），只涉及本事务管理的 Xray 与 node-panel，不触碰 Cloudflared
-- 校验恢复结果，成功后写入 ROLLED_BACK，失败则写入 ROLLBACK_FAILED 并保留全部备份
+- 在覆盖某个服务的配置文件之前，先停止对应服务：若 systemctl stop 失败、停止后服务仍处于 active 状态、或安装前未启用而 disable 失败，都会立即中止文件恢复，绝不在服务运行时覆盖其配置
+- 校验恢复结果，成功后写入 ROLLED_BACK，失败则写入 ROLLBACK_FAILED 并保留全部备份；最终状态（ROLLED_BACK / ROLLBACK_FAILED）写入或回读校验失败时，不会报告“回滚成功”，而是以非零退出并明确提示状态持久化失败
 
 恢复支持断点续跑：`--recover` 执行到一半再次被 SIGKILL / 断电时，下一次执行会依据持久化的 restore-journal.tsv 判断每个文件的进度，而不是只看 hashes.tsv：
 
