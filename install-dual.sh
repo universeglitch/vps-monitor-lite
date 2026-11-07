@@ -176,9 +176,20 @@ detect_existing(){
       red "检测到已有部署文件：$item"; found=1
     fi
   done
-  if command -v xray >/dev/null 2>&1 || [[ -x /usr/local/bin/xray ]]; then
-    red "检测到已有 Xray 程序：$(command -v xray 2>/dev/null || echo /usr/local/bin/xray)"; found=1
+  local xray_bin=""
+  xray_bin="$(command -v xray 2>/dev/null || true)"
+
+  for item in /usr/local/bin/xray /usr/bin/xray /usr/local/sbin/xray /usr/sbin/xray; do
+  if [[ -x "$item" ]]; then
+    xray_bin="$item"
+    break
   fi
+  done
+
+if [[ -n "$xray_bin" ]]; then
+  red "检测到已有 Xray 程序：$xray_bin"
+  found=1
+fi
   if systemctl cat xray.service >/dev/null 2>&1; then
     red "检测到已有 xray.service"; found=1
   fi
