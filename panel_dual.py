@@ -449,15 +449,17 @@ def find_vless_inbound(port):
 
 
 def get_uris():
-    ws_cfg, reality_cfg = panel_config["ws"], panel_config["reality"]
+    ws_cfg = panel_config["ws"]
     ws_inbound = find_vless_inbound(ws_cfg["listen_port"])
     ws_clients = ws_inbound.get("settings", {}).get("clients", [])
     ws_stream = ws_inbound.get("streamSettings", {})
     ws_settings = ws_stream.get("wsSettings", {})
     ws_uid = ws_clients[0].get("id") if ws_clients else None
     ws_path = ws_settings.get("path") or ws_cfg.get("path")
+
     if not ws_uid or not ws_path or ws_stream.get("network") != "ws":
         raise RuntimeError("WS 入站配置不完整或传输类型不是 ws")
+
     ws_host, ws_port = str(ws_cfg["host"]).strip(), int(ws_cfg["port"])
     ws_query = urlencode({
         "encryption": "none", "security": "tls", "sni": ws_host,
@@ -465,23 +467,36 @@ def get_uris():
     }, quote_via=quote)
     ws_uri = f"vless://{ws_uid}@{ws_host}:{ws_port}?{ws_query}#Node-A-WS"
 
-    reality_inbound = find_vless_inbound(reality_cfg["listen_port"])
-    reality_clients = reality_inbound.get("settings", {}).get("clients", [])
-    reality_stream = reality_inbound.get("streamSettings", {})
-    reality_uid = reality_clients[0].get("id") if reality_clients else None
-    if not reality_uid or reality_stream.get("security") != "reality":
-        raise RuntimeError("REALITY 入站配置不完整或安全类型不是 reality")
-    reality_host, reality_port = str(reality_cfg["address"]).strip(), int(reality_cfg["port"])
-    reality_query = urlencode({
-        "encryption": "none", "security": "reality",
-        "sni": str(reality_cfg["server_name"]),
-        "fp": str(reality_cfg.get("fingerprint", "chrome")),
-        "pbk": str(reality_cfg["public_key"]), "sid": str(reality_cfg["short_id"]),
-        "type": str(reality_cfg.get("network", "tcp")),
-        "flow": str(reality_cfg.get("flow", "xtls-rprx-vision"))
-    }, quote_via=quote)
-    reality_uri = f"vless://{reality_uid}@{reality_host}:{reality_port}?{reality_query}#Node-B-REALITY"
-    return {"ws": ws_uri, "reality": reality_uri}
+    result = {"ws": ws_uri}
+
+    if panel_config["reality_enabled"]:
+        reality_cfg = panel_config["reality"]
+        reality_inbound = find_vless_inbound(reality_cfg["listen_port"])
+        reality_clients = reality_inbound.get("settings", {}).get("clients", [])
+        reality_stream = reality_inbound.get("streamSettings", {})
+        reality_uid = reality_clients[0].get("id") if reality_clients else None
+
+        if not reality_uid or reality_stream.get("security") != "reality":
+            raise RuntimeError("REALITY 入站配置不完整或安全类型不是 reality")
+
+        reality_host = str(reality_cfg["address"]).strip()
+        reality_port = int(reality_cfg["port"])
+        reality_query = urlencode({
+            "encryption": "none", "security": "reality",
+            "sni": str(reality_cfg["server_name"]),
+            "fp": str(reality_cfg.get("fingerprint", "chrome")),
+            "pbk": str(reality_cfg["public_key"]),
+            "sid": str(reality_cfg["short_id"]),
+            "type": str(reality_cfg.get("network", "tcp")),
+            "flow": str(reality_cfg.get("flow", "xtls-rprx-vision"))
+        }, quote_via=quote)
+
+        result["reality"] = (
+            f"vless://{reality_uid}@{reality_host}:{reality_port}"
+            f"?{reality_query}#Node-B-REALITY"
+        )
+
+    return result
 
 
 def lookup_visitor_network(ip):
