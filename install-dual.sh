@@ -374,7 +374,7 @@ done
 green "[2/8] 安装 Xray"
 
 if ! command -v xray >/dev/null 2>&1; then
-  bash -c "$(curl -fsSL "$XRAY_INSTALL")" @ install --without-geodata
+  bash -c "$(curl -fsSL "$XRAY_INSTALL")" @ install --without-geodata --without-logfiles
 fi
 
 XRAY_BIN="$(command -v xray || true)"
