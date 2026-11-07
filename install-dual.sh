@@ -98,9 +98,33 @@ rollback_all(){
 
   systemctl daemon-reload >/dev/null 2>&1 || failed=1
 
-  # 本脚本的覆盖保护要求安装前不存在这两个服务；失败回滚后应保持停止/禁用。
-  systemctl disable node-panel.service >/dev/null 2>&1 || true
-  systemctl disable xray.service >/dev/null 2>&1 || true
+# 恢复 Xray 原来的启用状态
+if [[ "$XRAY_WAS_ENABLED" == "1" ]]; then
+  systemctl enable xray.service >/dev/null 2>&1 || failed=1
+else
+  systemctl disable xray.service >/dev/null 2>&1 || failed=1
+fi
+
+# 恢复面板原来的启用状态
+if [[ "$NODEPANEL_WAS_ENABLED" == "1" ]]; then
+  systemctl enable node-panel.service >/dev/null 2>&1 || failed=1
+else
+  systemctl disable node-panel.service >/dev/null 2>&1 || failed=1
+fi
+
+# 恢复 Xray 原来的运行状态
+if [[ "$XRAY_WAS_ACTIVE" == "1" ]]; then
+  systemctl start xray.service >/dev/null 2>&1 || failed=1
+else
+  systemctl stop xray.service >/dev/null 2>&1 || failed=1
+fi
+
+# 恢复面板原来的运行状态
+if [[ "$NODEPANEL_WAS_ACTIVE" == "1" ]]; then
+  systemctl start node-panel.service >/dev/null 2>&1 || failed=1
+else
+  systemctl stop node-panel.service >/dev/null 2>&1 || failed=1
+fi
 
   for ((i=${#TRACK_DIRS[@]}-1; i>=0; i--)); do
     rmdir -- "${TRACK_DIRS[$i]}" 2>/dev/null || true
