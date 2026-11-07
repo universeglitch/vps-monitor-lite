@@ -293,52 +293,13 @@ rm -rf /opt/node-panel
 
 核心原则：先检查（--check）、再恢复（--recover）、最后重新安装。不要用删除文件的方式绕过安装保护。
 
-## Node Monitor Panel Backup
+## 仓库内容与凭据说明
 
-Contents:
+本仓库仅包含程序与模板（panel.py、node-panel.service 等），**不携带任何凭据**：
 
-1. panel.py —— Current panel source code.
-2. node-panel.service —— Clean systemd service template without credentials.
+- 不含 auth.json（登录凭据）
+- 不含 secret.key（会话密钥）
+- 不含 Xray 配置
+- 不含 Cloudflare Tunnel 凭据
 
-IMPORTANT SECURITY NOTES:
-
-- This archive does not contain auth.json.
-- This archive does not contain secret.key.
-- This archive does not contain Xray configuration.
-- This archive does not contain Cloudflare Tunnel credentials.
-- Existing login credentials and sessions cannot be restored from this archive.
-
-INSTALLATION:
-
-```bash
-# 1. Create the directory:
-mkdir -p /opt/node-panel
-
-# 2. Copy panel.py:
-cp panel.py /opt/node-panel/panel.py
-
-# 3. Install the service template:
-cp node-panel.service /etc/systemd/system/node-panel.service
-
-# 4. Ensure the authentication files are separately configured:
-#    /etc/node-panel/auth.json
-#    /etc/node-panel/secret.key
-
-# 5. Reload and start:
-systemctl daemon-reload
-systemctl enable node-panel
-systemctl restart node-panel
-
-# 6. Check service status:
-systemctl status node-panel
-```
-
-NOTE:
-The service template assumes the panel runs as root and uses
-/usr/bin/python3. Verify the paths and authentication files
-before restoring on another machine.
-
-```text
-#installation
-use install.sh
-```
+因此已有登录凭据与会话无法从本仓库恢复；这些文件由部署时生成，请自行妥善保管。
