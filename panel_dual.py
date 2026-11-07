@@ -176,7 +176,7 @@ hr{border:0;border-top:1px solid #ffffff18;margin:22px 0}
   <div class="diag-note" id="networkStatus">登录后自动执行一次网络诊断。</div>
   <hr>
   <h2 style="font-size:19px">NekoBox 节点配置</h2>
-<div class="sub">WS + TLS（Cloudflare Tunnel）与 REALITY（TCP 直连）独立展示</div>
+<div class="sub">根据部署模式显示可用节点配置</div>
 <div class="grid">
 <div class="tile">
 <h3 style="margin:0 0 12px">节点 A · VLESS + WS + TLS</h3>
@@ -439,7 +439,7 @@ def get_status():
     total = mem.get("MemTotal", 0)
     available = mem.get("MemAvailable", 0)
     used = max(0, total - available)
-        return {
+    return {
         "xray": service_active("xray"),
         "tunnel": service_active("cloudflared"),
         "node_a": port_active(int(panel_config["ws"]["listen_port"])),
@@ -451,7 +451,7 @@ def get_status():
         "memory_used": str(round(used / 1024)) + " MB",
         "memory_total": str(round(total / 1024)) + " MB",
         "memory_percent": round(used * 100 / total) if total else 0
-        }
+    }
 
 
 def find_vless_inbound(port):
@@ -787,31 +787,31 @@ class Handler(BaseHTTPRequestHandler):
                     "application/json"
                 )
             elif action == "config":
-            uris = get_uris()
-            nodes = {
-            "ws": {"uri": uris["ws"]}
-             }
+                uris = get_uris()
+                nodes = {
+                    "ws": {"uri": uris["ws"]}
+                }
 
-            if panel_config["reality_enabled"]:
-            nodes["reality"] = {"uri": uris["reality"]}
+                if panel_config["reality_enabled"]:
+                    nodes["reality"] = {"uri": uris["reality"]}
 
-            self.send_body(
-            200,
-            json.dumps({"nodes": nodes}, ensure_ascii=False),
-            "application/json"
-            )
+                self.send_body(
+                    200,
+                    json.dumps({"nodes": nodes}, ensure_ascii=False),
+                    "application/json"
+                )
             elif action in ("qr", "download"):
                 node = parse_qs(parsed.query).get("node", ["ws"])[0].lower()
 
-            if node not in ("ws", "reality"):
-            self.send_body(400, "Invalid node")
-            return
+                if node not in ("ws", "reality"):
+                    self.send_body(400, "Invalid node")
+                    return
 
-            if node == "reality" and not panel_config["reality_enabled"]:
-            self.send_body(404, "Reality node is not enabled")
-            return
+                if node == "reality" and not panel_config["reality_enabled"]:
+                    self.send_body(404, "Reality node is not enabled")
+                    return
 
-    uri = get_uris()[node]
+                uri = get_uris()[node]
                 if action == "qr":
                     img = qrcode.make(uri)
                     buf = BytesIO()
@@ -819,7 +819,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_body(200, buf.getvalue(), "image/png")
                 else:
                     filename = "node-ws.txt" if node == "ws" else "node-reality.txt"
-                    self.send_body(200, uri + "\\n", "text/plain; charset=utf-8",
+                    self.send_body(200, uri + "\n", "text/plain; charset=utf-8",
                                    {"Content-Disposition": f'attachment; filename="{filename}"'})
             else:
                 self.send_body(404, "Not found")
