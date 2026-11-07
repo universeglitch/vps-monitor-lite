@@ -156,18 +156,30 @@ trap 'exit 143' TERM
 
 detect_existing(){
   local found=0 item
-  local -a paths=(
+    local -a paths=(
     "$XRAY_CONFIG" "$PANEL_FILE" "$PANEL_CONFIG" "$AUTH_FILE" "$SECRET_FILE"
     "/etc/systemd/system/node-panel.service"
     "/etc/systemd/system/xray.service" "/etc/systemd/system/xray@.service"
     "/usr/local/lib/systemd/system/xray.service" "/usr/local/lib/systemd/system/xray@.service"
     "/lib/systemd/system/xray.service" "/lib/systemd/system/xray@.service"
+    "/etc/systemd/system/xray.service.d"
+    "/etc/systemd/system/xray@.service.d"
+    "/var/log/xray"
   )
   for item in "${paths[@]}"; do
     if [[ -e "$item" || -L "$item" ]]; then
       red "检测到已有部署文件：$item"; found=1
     fi
   done
+    if getent passwd xray >/dev/null 2>&1; then
+    red "检测到已有 Xray 用户"
+    found=1
+  fi
+
+  if getent group xray >/dev/null 2>&1; then
+    red "检测到已有 Xray 用户组"
+    found=1
+  fi
   local xray_bin=""
   xray_bin="$(command -v xray 2>/dev/null || true)"
 
