@@ -259,12 +259,6 @@ read -r -p "> " CONFIRM
 green "安装前覆盖保护检查"
 detect_existing
 
-for p in "$WS_PORT" "$REALITY_PORT" "$PANEL_PORT"; do
-  if port_in_use "$p"; then
-    die "端口 $p 已被占用，请更换端口或先处理占用进程。"
-  fi
-done
-
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$(mktemp -d "/var/backups/node-panel-install-${STAMP}.XXXXXX")"
 mkdir -p "$BACKUP_DIR/files"
