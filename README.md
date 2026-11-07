@@ -173,12 +173,35 @@ bash install-dual.sh --check
 state.txt      事务状态文件（权限 600），字段包括：
                transaction_id, created_at, updated_at, status,
                current_stage, xray_was_active, xray_was_enabled,
-               node_panel_was_active, node_panel_was_enabled
-manifest.tsv   事务清单：每个被管理文件的“真实路径、备份相对路径、安装前是否存在”
+               node_panel_was_active, node_panel_was_enabled,
+               manifest_complete, hashes_complete
+manifest.tsv   事务清单：每个被管理文件的“真实路径、备份相对路径、安装前是否存在、安装前指纹”
+hashes.tsv     每个被管理文件的“安装后指纹”（用于判断目标是否被外部修改）
+restore-journal.tsv  逐文件恢复日志（权限 600）：恢复动作与状态，使 --recover 可断点续跑
 dirs.txt       本次安装新建的目录列表
 meta.txt       记录 Xray 用户/用户组安装前是否存在
 files/         被备份的文件副本
 ```
+
+其中 manifest_complete 与 hashes_complete 是两个独立标记，含义不同，不能混用：
+
+```text
+manifest_complete=1   备份清单（含安装前指纹）已完整写入，可据以恢复
+hashes_complete=1     所有受管文件的“安装后指纹”都已记录
+```
+
+安装中途被 SIGKILL / 断电时，通常 manifest_complete=1 而 hashes_complete=0：此时对“已改动但无安装后指纹”的文件，恢复会保守拒绝，绝不猜测其归属。
+
+逐文件恢复日志 restore-journal.tsv 的每条记录包含：日志版本、源路径、恢复动作（RESTORE/REMOVE）、当前状态、安装前指纹、安装后指纹。状态取值：
+
+```text
+PENDING    尚未开始
+INTENT     已持久化恢复意图，尚未确认完成
+RESTORED   已成功恢复到安装前状态
+REMOVED    原本不存在的文件已安全移除
+```
+
+该文件采用“临时文件 + 原子替换 + 回读校验 + 目录持久化”写入，因此任意时刻被 SIGKILL / 断电，日志要么是旧版本、要么是新版本，绝不会半写。
 
 status 取值：
 
@@ -237,19 +260,29 @@ bash install-dual.sh --recover   # 再恢复
 `--recover` 会：
 
 - 扫描 /var/backups/node-panel-install-*，列出状态为 IN_PROGRESS / ROLLBACK_IN_PROGRESS / ROLLBACK_FAILED 的事务，并显示创建时间、失败阶段、备份目录
-- 校验备份完整性（清单是否存在、应备份的文件是否都在、状态文件是否可用）
+- 校验备份完整性：逐项核对每个备份的类型、内容、权限、属主/属组与清单记录的安装前指纹是否一致（不只是判断“文件是否存在”）；任何一项损坏都会拒绝恢复，并明确报告是哪一个备份损坏
 - 列出安装前服务状态，供你确认
 - 需要你选择事务编号并显式输入 yes 确认后才执行
 - 按该事务的清单恢复文件；只恢复清单中记录的文件，只删除清单中记录为“安装前不存在”的文件，并保留权限、属主、时间戳、符号链接属性
-- 恢复服务的启用/运行状态（依据 state.txt 记录）
+- 每个文件先写入并持久化恢复意图（INTENT），再以“同文件系统临时文件 + 原子替换”的方式还原，绝不把备份直接复制到正式路径（避免中断留下半截文件）；符号链接按链接本身还原，不跟随链接覆盖
+- 恢复服务的启用/运行状态（依据 state.txt 记录），只涉及本事务管理的 Xray 与 node-panel，不触碰 Cloudflared
 - 校验恢复结果，成功后写入 ROLLED_BACK，失败则写入 ROLLBACK_FAILED 并保留全部备份
+
+恢复支持断点续跑：`--recover` 执行到一半再次被 SIGKILL / 断电时，下一次执行会依据持久化的 restore-journal.tsv 判断每个文件的进度，而不是只看 hashes.tsv：
+
+- 已标记 RESTORED 的文件，只要当前确实等于安装前指纹，就跳过（不会因为“不再是安装后状态”而被误判为外部修改）
+- 已标记 REMOVED 的文件，只要目标确实不存在，就跳过
+- 处于 INTENT 的文件：若当前已等于安装前指纹，说明上次原子替换其实已完成，仅补记 RESTORED；若当前仍等于安装后指纹，则可安全重试
+- 与安装前、安装后指纹都不一致，或缺安装后指纹又与安装前不一致，一律保守拒绝，绝不覆盖
+
+关键持久化（写入状态文件、恢复日志、指纹记录、fsync）一旦失败会立即中止后续危险操作，不会静默忽略，也不会误报恢复成功。
 
 恢复原则：
 
 - 不会影响 Cloudflared
 - 不会删除任何备份目录
 - 不是通过 rm -rf 实现
-- 如果备份不完整、状态文件损坏或清单与目标不匹配，会停止并提示人工处理，不会猜测或强制恢复
+- 如果备份不完整、备份内容与安装前指纹不一致、状态文件损坏或清单与目标不匹配，会停止并提示人工处理，不会猜测或强制恢复
 
 ## 10. 为什么第二次运行安装脚本会提示已有文件？
 

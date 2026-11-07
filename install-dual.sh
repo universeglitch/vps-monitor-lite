@@ -38,6 +38,9 @@ MANIFEST_FILE="manifest.tsv"
 DIRS_FILE="dirs.txt"
 META_FILE="meta.txt"
 HASH_FILE="hashes.tsv"
+# 逐文件恢复日志：记录每个受管文件的恢复动作与状态，使 --recover 可断点续跑。
+JOURNAL_FILE="restore-journal.tsv"
+JOURNAL_VERSION="1"
 
 red(){ echo -e "\033[31m$*\033[0m"; }
 green(){ echo -e "\033[32m$*\033[0m"; }
@@ -161,12 +164,22 @@ state_status_ok(){
   return 1
 }
 
-# 尽力把文件刷入磁盘，降低断电丢失状态/指纹的风险（失败不影响主流程）
+# 把文件/目录刷入磁盘，降低断电丢失状态/指纹/恢复日志的风险。
+# 关键持久化操作失败必须被调用方感知，因此这里绝不返回假成功：
+#   - 成功持久化返回 0；
+#   - 目标不存在视为无需持久化，返回 0；
+#   - 所有可用手段（sync -f 目标 / sync 全量）都失败时返回 1，
+#     由调用方决定是中止危险操作还是明确降级，绝不静默忽略。
 fsync_path(){
   local f="$1"
   [[ -e "$f" ]] || return 0
-  command sync -f "$f" 2>/dev/null || command sync 2>/dev/null || true
-  return 0
+  if command sync -f "$f" 2>/dev/null; then
+    return 0
+  fi
+  if command sync 2>/dev/null; then
+    return 0
+  fi
+  return 1
 }
 
 # 校验状态文件：字段齐全（manifest_complete / hashes_complete 均为合法值），可选校验 status / current_stage
@@ -233,7 +246,11 @@ state_write(){
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
   fi
-  fsync_path "$tmp"
+  if ! fsync_path "$tmp"; then
+    red "错误：无法持久化状态临时文件（fsync 失败）：$tmp"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
   if ! chmod 600 "$tmp"; then
     red "错误：无法设置状态文件权限（应为 600）：$tmp"
     rm -f -- "$tmp" 2>/dev/null || true
@@ -249,7 +266,15 @@ state_write(){
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
   fi
-  fsync_path "$target"
+  if ! fsync_path "$target"; then
+    red "错误：无法持久化状态文件（fsync 失败）：$target"
+    return 1
+  fi
+  # 持久化目录项，确保 rename 本身也已落盘
+  if ! fsync_path "$BACKUP_DIR"; then
+    red "错误：无法持久化事务目录（fsync 失败）：$BACKUP_DIR"
+    return 1
+  fi
   # rename 后回读验证完整字段，任何缺失/不一致都视为写入失败
   if ! state_verify_fields "$target" "$status" "$stage"; then
     red "错误：状态文件回读校验失败：$target"
@@ -263,7 +288,10 @@ state_write(){
 # 这样即使在这之后（下一阶段内）被 SIGKILL，已发生的改动都有可验证依据。
 set_stage(){
   if [[ "${MANIFEST_COMPLETE:-0}" == "1" && -n "${BACKUP_DIR:-}" ]]; then
-    record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE" || true
+    # 关键指纹记录失败必须中止：绝不在关键指纹无法可靠落盘时继续修改受管文件。
+    if ! record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE"; then
+      die "无法持久化受管文件的安装后指纹，安装中止（备份目录：$BACKUP_DIR）。"
+    fi
   fi
   if ! state_write "IN_PROGRESS" "$1"; then
     die "无法更新安装状态（阶段：$1），安装中止。"
@@ -323,25 +351,37 @@ track_file(){
 # 记录某文件当前的“安装后指纹”，持久化追加写入 hashes.tsv。
 # 每行：<路径>\t<指纹>\tpost，同路径以最后一条为准。
 # 追加后立即 fsync，确保安装中途 SIGKILL / 断电时该记录仍可读。
+# 追加或持久化失败都必须返回非 0，由调用方决定是否中止，
+# 绝不在关键指纹无法可靠记录时继续修改受管文件。
 record_hash(){
   local src="$1"
   [[ -n "${BACKUP_DIR:-}" && -d "${BACKUP_DIR:-}" ]] || return 0
   local j="$BACKUP_DIR/$HASH_FILE"
-  printf '%s\t%s\tpost\n' "$src" "$(file_fingerprint "$src")" >> "$j" || return 1
-  fsync_path "$j"
+  if ! printf '%s\t%s\tpost\n' "$src" "$(file_fingerprint "$src")" >> "$j"; then
+    red "错误：无法写入安装后指纹记录：$j"
+    return 1
+  fi
+  if ! fsync_path "$j"; then
+    red "错误：无法持久化安装后指纹记录（fsync 失败）：$j"
+    return 1
+  fi
+  return 0
 }
 
 # 为清单中所有受管文件记录当前“安装后指纹”。
 # 在安装的每个阶段边界以及受管文件被外部安装器改写之后调用，
 # 以尽量缩小子进程被强杀时“已改动但无记录”的窗口。
+# 任一文件记录失败即返回非 0（注意：安装阶段“修改文件”与“记录指纹”之间
+# 仍存在无法消除的中断窗口；无安装后指纹的文件恢复时会保守拒绝，绝不猜测归属）。
 record_manifest_hashes(){
   local manifest="$1"
   [[ -f "$manifest" ]] || return 0
   local s r e pre
   while IFS=$'\t' read -r s r e pre; do
     [[ -n "${s:-}" ]] || continue
-    record_hash "$s"
+    record_hash "$s" || return 1
   done < "$manifest"
+  return 0
 }
 
 # 读取 hashes.tsv 中某文件的最新指纹（无则输出空）
@@ -355,6 +395,123 @@ manifest_has(){
   local dir="$1" path="$2"
   [[ -f "$dir/$MANIFEST_FILE" ]] || return 1
   awk -F'\t' -v p="$path" '$1==p{found=1} END{exit !found}' "$dir/$MANIFEST_FILE"
+}
+
+# =========================================================
+# 逐文件恢复日志（restore-journal.tsv）——断点续跑的核心
+# =========================================================
+# 每行 6 列（制表符分隔）：
+#   <版本>  <源路径>  <动作>  <状态>  <安装前指纹>  <安装后指纹>
+# 动作：RESTORE（安装前存在，需还原）/ REMOVE（安装前不存在，需删除）
+# 状态：PENDING / INTENT / RESTORED / REMOVED
+#   PENDING  尚未开始
+#   INTENT   已持久化恢复意图，尚未确认完成
+#   RESTORED 已成功恢复到安装前状态
+#   REMOVED  原本不存在的文件已安全移除
+# 更新方式：整表原子重写（临时文件 + fsync + rename + 回读校验 + 目录持久化），
+# 任意时刻被 SIGKILL/断电，日志要么是旧版本、要么是新版本，绝不半写。
+
+# 读取某源路径的日志记录，输出 "状态\t动作\t安装前指纹\t安装后指纹"（无则空）
+journal_record(){
+  local dir="$1" src="$2"
+  local f="$dir/$JOURNAL_FILE"
+  [[ -f "$f" ]] || return 0
+  awk -F'\t' -v s="$src" '
+    $2==s { st=$4; ac=$3; pr=$5; po=$6 }
+    END { if (st!="") printf "%s\t%s\t%s\t%s", st, ac, pr, po }
+  ' "$f" 2>/dev/null || true
+}
+
+# 读取某源路径的日志状态（无记录则输出空）
+journal_state(){
+  local r; r="$(journal_record "$1" "$2")"
+  printf '%s' "${r%%$'\t'*}"
+}
+
+# 原子写入/更新某源路径的恢复日志记录。任何一步失败都返回非 0。
+journal_set(){
+  local dir="$1" src="$2" action="$3" state="$4" pre="$5" post="${6:-}"
+  if [[ -z "$src" || -z "$dir" ]]; then
+    red "恢复日志写入失败：参数不足（src 为空）"
+    return 1
+  fi
+  case "$state" in
+    PENDING|INTENT|RESTORED|REMOVED) ;;
+    *) red "恢复日志写入失败：非法状态取值：${state:-空}"; return 1 ;;
+  esac
+  case "$action" in
+    RESTORE|REMOVE|SERVICE) ;;
+    *) red "恢复日志写入失败：非法动作取值：${action:-空}"; return 1 ;;
+  esac
+
+  local f="$dir/$JOURNAL_FILE"
+  local tmp="$dir/.$JOURNAL_FILE.tmp.$$"
+  if ! {
+    # 保留其它路径的既有记录，替换本路径记录
+    if [[ -f "$f" ]]; then
+      awk -F'\t' -v s="$src" 'NF && $2!=s' "$f"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$JOURNAL_VERSION" "$src" "$action" "$state" "$pre" "${post:-}"
+  } > "$tmp"; then
+    red "错误：无法写入恢复日志临时文件：$tmp"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! fsync_path "$tmp"; then
+    red "错误：无法持久化恢复日志临时文件（fsync 失败）：$tmp"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! chmod 600 "$tmp"; then
+    red "错误：无法设置恢复日志权限（应为 600）：$tmp"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$f"; then
+    red "错误：无法替换恢复日志：$f"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! fsync_path "$f"; then
+    red "错误：无法持久化恢复日志（fsync 失败）：$f"
+    return 1
+  fi
+  if ! fsync_path "$dir"; then
+    red "错误：无法持久化事务目录（fsync 失败）：$dir"
+    return 1
+  fi
+  # 回读校验：确认状态与动作已按预期落盘
+  local got; got="$(journal_state "$dir" "$src")"
+  if [[ "$got" != "$state" ]]; then
+    red "错误：恢复日志回读校验失败（期望 $state，实际 ${got:-空}）：$f"
+    return 1
+  fi
+  return 0
+}
+
+# 校验备份条目：备份必须位于事务目录内、类型/内容/权限/属主与安装前指纹一致。
+# 返回 0 表示备份可用；否则返回 1 并打印具体原因。
+# 覆盖：普通文件内容、权限、owner/group、符号链接目标与属性、目录类型与内容摘要。
+verify_backup_entry(){
+  local dir="$1" src="$2" rel="$3" pre="$4"
+  if [[ -z "$rel" || "$rel" == /* || "$rel" == *..* ]]; then
+    red "备份校验失败：相对路径非法（禁止路径穿越）：${rel:-空}"
+    return 1
+  fi
+  local bak="$dir/$rel"
+  if [[ ! -e "$bak" && ! -L "$bak" ]]; then
+    red "备份校验失败：缺少备份文件：$bak"
+    return 1
+  fi
+  local bfp; bfp="$(file_fingerprint "$bak")"
+  if [[ "$bfp" != "$pre" ]]; then
+    red "备份校验失败：$bak 与安装前指纹不一致（可能被损坏或篡改）。"
+    red "  期望：$pre"
+    red "  实际：$bfp"
+    return 1
+  fi
+  return 0
 }
 
 # 恢复服务启用状态：安装前未启用则必须确保恢复后仍未启用
@@ -448,11 +605,75 @@ verify_service_state(){
   (( ok == 1 ))
 }
 
+# 单个文件的安全恢复：备份 → 同文件系统临时路径 → 校验 → 原子替换 → 持久化 → 复核指纹。
+# 绝不直接把备份写入正式目标（复制中途被中断会留下半截文件）。
+# 符号链接按链接本身处理（cp -a 不跟随链接），保留其目标与属性；
+# 目录项因无法保证原子替换而明确拒绝自动恢复（保留备份，提示人工处理）。
+restore_one_file(){
+  local dir="$1" src="$2" rel="$3" pre="$4"
+  local bak="$dir/$rel"
+
+  case "$pre" in
+    DIR:*)
+      red "恢复失败：$src 是目录项，无法安全原子替换，已保留备份，请人工恢复。"
+      return 1
+      ;;
+  esac
+
+  local dstdir; dstdir="$(dirname "$src")"
+  if ! mkdir -p -- "$dstdir"; then
+    red "恢复失败：无法创建目标目录：$dstdir"
+    return 1
+  fi
+
+  # 临时文件放在目标同一目录（同一文件系统），保证后续 rename 为原子操作
+  local tmp="$dstdir/.node-panel-restore.${BASHPID:-$$}.$RANDOM"
+  # 清理此前被中断遗留的本命名空间临时文件（本事务持有 flock，无并发写入者）
+  find "$dstdir" -maxdepth 1 -name '.node-panel-restore.*' -exec rm -f -- {} + 2>/dev/null || true
+  rm -f -- "$tmp" 2>/dev/null || true
+  if ! cp -a -- "$bak" "$tmp"; then
+    red "恢复失败：无法将备份复制到临时路径：$tmp"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  # 校验临时文件的内容/类型/权限/属主与安装前指纹一致
+  local tfp; tfp="$(file_fingerprint "$tmp")"
+  if [[ "$tfp" != "$pre" ]]; then
+    red "恢复失败：临时文件指纹与安装前指纹不一致（$tfp != $pre）"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  # 原子替换（-T 保证目标是文件/符号链接时不会误判为目录移动）
+  if ! mv -fT -- "$tmp" "$src" 2>/dev/null; then
+    if [[ ! -d "$src" ]] && ! mv -f -- "$tmp" "$src"; then
+      red "恢复失败：无法原子替换目标：$src"
+      rm -f -- "$tmp" 2>/dev/null || true
+      return 1
+    fi
+  fi
+  # 持久化目标所在目录，确保 rename 本身也已落盘
+  if ! fsync_path "$dstdir"; then
+    red "恢复失败：无法持久化目标目录：$dstdir"
+    return 1
+  fi
+  # 重新计算目标指纹，确认与安装前一致
+  local cfp; cfp="$(file_fingerprint "$src")"
+  if [[ "$cfp" != "$pre" ]]; then
+    red "恢复失败：$src 替换后指纹与安装前不一致（$cfp != $pre）"
+    return 1
+  fi
+  return 0
+}
+
 # 按事务清单恢复（供自动回滚与 --recover 共用）。
-# 完全依赖磁盘上的清单/状态文件，可在新的 Shell 中独立运行。
-# verify=1（--recover）时先校验目标文件与事务预期一致，不一致则停止，绝不覆盖。
+# 完全依赖磁盘上的清单/状态/指纹文件与逐文件恢复日志 restore-journal.tsv，
+# 可在新的 Shell 中独立运行，并支持被 SIGKILL / 断电打断后再次续跑：
+#   - 已 RESTORED / REMOVED 的文件会被识别并跳过，绝不因“不再是安装后状态”而被误判为外部修改；
+#   - INTENT 的文件按“当前 == 安装前指纹（此前已替换完成）”或“当前 == 安装后指纹（可安全重试）”区分处理；
+#   - 与安装前、安装后指纹都不一致，或缺安装后指纹又与安装前不一致的文件，一律保守拒绝，绝不覆盖。
+# 兼容调用方传入的第二个参数（历史 verify 标志），恢复前始终逐项校验目标与备份。
 restore_transaction(){
-  local dir="$1" verify="${2:-0}"
+  local dir="$1"
   local st="$dir/$STATE_FILE"
   local manifest="$dir/$MANIFEST_FILE"
   local dirs="$dir/$DIRS_FILE"
@@ -464,13 +685,6 @@ restore_transaction(){
     return 1
   fi
 
-  if [[ "$verify" == "1" ]]; then
-    if ! verify_recovery_targets "$dir"; then
-      red "目标文件与事务预期不一致，已停止恢复以避免覆盖外部修改。"
-      return 1
-    fi
-  fi
-
   local xa xe na ne xu_existed xg_existed
   xa="$(state_get "$st" xray_was_active)"
   xe="$(state_get "$st" xray_was_enabled)"
@@ -479,7 +693,7 @@ restore_transaction(){
   xu_existed="$(state_get "$meta" xray_user_existed)"
   xg_existed="$(state_get "$meta" xray_group_existed)"
 
-  # 只停止“由本事务管理”的服务，避免影响不属于本事务的外部服务。
+  # 只停止“由本事务管理”的服务，避免影响不属于本事务的外部服务（幂等，可重复执行）。
   local panel_owned=0 xray_owned=0
   if manifest_has "$dir" "$NODE_PANEL_UNIT"; then panel_owned=1; fi
   if manifest_has "$dir" "/usr/local/bin/xray" ||
@@ -508,49 +722,163 @@ restore_transaction(){
     S+=("$s"); R+=("$r"); E+=("$e"); P+=("${p:-}")
   done < "$manifest"
 
-  local i src rel existed pre rc
+  local i src rel existed pre post jstate cur
   for ((i=${#S[@]}-1; i>=0; i--)); do
     src="${S[$i]}"; rel="${R[$i]}"; existed="${E[$i]}"; pre="${P[$i]}"
+
     # 防御：拒绝可疑清单路径，避免误删/误写
     if [[ "$src" != /* || "$src" == *..* || "$rel" == /* || "$rel" == *..* ]]; then
-      red "恢复失败：清单路径非法（src=$src rel=$rel）"; failed=1; continue
+      red "恢复失败：清单路径非法（src=$src rel=$rel）"
+      failed=1; break
     fi
-    # 每个文件实际恢复前再次校验目标指纹：
-    # 若初次检查后目标被外部修改（或被改动后无记录、归属未知），
-    # 立即停止后续恢复并保留备份，绝不覆盖。
-    if [[ "$verify" == "1" ]]; then
-      rc=0
-      check_recovery_target "$dir" "$src" "$pre" || rc=$?
-      if (( rc != 0 )); then
-        if (( rc == 1 )); then
-          red "恢复中止：$src 在恢复前被外部修改，停止后续恢复并保留备份。"
-        else
-          red "恢复中止：$src 无安装后指纹且与安装前不一致（归属未知），保守拒绝恢复。"
-        fi
-        failed=1
-        break
-      fi
-    fi
-    bak="$dir/$rel"
+
+    post="$(hash_of "$dir" "$src")"          # 已记录的安装后指纹（可能为空）
+    jstate="$(journal_state "$dir" "$src")"  # 持久化恢复日志状态（可能为空→视为 PENDING）
+    cur="$(file_fingerprint "$src")"
+
     if [[ "$existed" == "1" ]]; then
-      if [[ -e "$bak" || -L "$bak" ]]; then
-        if ! mkdir -p "$(dirname "$src")" || ! cp -a --remove-destination "$bak" "$src"; then
-          red "恢复失败：无法还原 $src"; failed=1
-        fi
-      else
-        red "恢复失败：备份不完整，缺少 $bak"; failed=1
+      # 安装前存在 → 需还原。先从备份完整性开始校验。
+      if ! verify_backup_entry "$dir" "$src" "$rel" "$pre"; then
+        red "恢复中止：$src 的备份不可用，已停止后续恢复并保留全部备份。"
+        failed=1; break
+      fi
+
+      case "$jstate" in
+        RESTORED)
+          if [[ "$cur" == "$pre" ]]; then
+            continue
+          fi
+          red "恢复中止：$src 日志标记为已恢复，但当前与安装前指纹不一致，状态异常，拒绝继续。"
+          failed=1; break
+          ;;
+        INTENT)
+          if [[ "$cur" == "$pre" ]]; then
+            # 上次原子替换已完成，仅“完成日志”未写入 → 标记 RESTORED 后跳过
+            if ! journal_set "$dir" "$src" RESTORE RESTORED "$pre" "$post"; then
+              red "恢复中止：无法持久化恢复日志（$src）。"; failed=1; break
+            fi
+            continue
+          fi
+          if [[ -n "$post" && "$cur" == "$post" ]]; then
+            : # 尚未完成正式替换，可安全重试
+          else
+            red "恢复中止：$src 处于 INTENT，但当前既非安装前也非已记录的安装后状态（归属未知），保守拒绝。"
+            failed=1; break
+          fi
+          ;;
+        PENDING|"")
+          if [[ -n "$post" ]]; then
+            if [[ "$cur" != "$post" ]]; then
+              red "恢复中止：$src 与已记录的安装后指纹不一致（可能被外部修改），禁止覆盖。"
+              failed=1; break
+            fi
+          else
+            if [[ "$cur" != "$pre" ]]; then
+              red "恢复中止：$src 无安装后指纹且与安装前状态不一致（归属未知），保守拒绝恢复。"
+              failed=1; break
+            fi
+          fi
+          ;;
+        *)
+          red "恢复中止：$src 的恢复日志状态非法（${jstate:-空}），保守拒绝。"
+          failed=1; break
+          ;;
+      esac
+
+      # 先持久化恢复意图，再执行实际替换
+      if ! journal_set "$dir" "$src" RESTORE INTENT "$pre" "$post"; then
+        red "恢复中止：无法持久化恢复意图（$src）。"
+        failed=1; break
+      fi
+      if ! restore_one_file "$dir" "$src" "$rel" "$pre"; then
+        failed=1; break
+      fi
+      if ! journal_set "$dir" "$src" RESTORE RESTORED "$pre" "$post"; then
+        red "恢复中止：无法持久化恢复完成状态（$src）。"
+        failed=1; break
       fi
     else
-      # 安装前不存在，属于本次新建，恢复时删除
+      # 安装前不存在 → 需安全移除（仅当能证明是本事务创建的）。
+      case "$jstate" in
+        REMOVED)
+          if [[ ! -e "$src" && ! -L "$src" ]]; then
+            continue
+          fi
+          red "恢复中止：$src 日志标记为已移除，但目标仍存在，拒绝继续。"
+          failed=1; break
+          ;;
+        INTENT)
+          if [[ ! -e "$src" && ! -L "$src" ]]; then
+            # 目标已不存在：仅当存在本事务“安装后指纹”证据（证明该文件确由本事务创建）
+            # 时，才能判定移除确由本事务完成并按幂等标记 REMOVED；否则无法证明归属，
+            # 保守拒绝，绝不把归属不明的外部删除当作恢复成功。
+            if [[ -z "$post" ]]; then
+              red "恢复中止：$src 处于 INTENT 且已不存在，但缺少安装后指纹证据，无法判断移除归属，保守拒绝。"
+              failed=1; break
+            fi
+            if ! journal_set "$dir" "$src" REMOVE REMOVED "$pre" "$post"; then
+              red "恢复中止：无法持久化恢复日志（$src）。"; failed=1; break
+            fi
+            continue
+          fi
+          if [[ -n "$post" && "$cur" == "$post" ]]; then
+            : # 可安全重试移除
+          else
+            red "恢复中止：$src 处于 INTENT 且仍存在，但无法证明归属本事务，保守拒绝删除。"
+            failed=1; break
+          fi
+          ;;
+        PENDING|"")
+          if [[ ! -e "$src" && ! -L "$src" ]]; then
+            if [[ -n "$post" ]]; then
+              # 本事务曾记录其安装后指纹（确由本事务创建），如今却消失，
+              # 且没有持久化 INTENT 证据 → 删除原因归属不明，保守拒绝。
+              red "恢复中止：$src 已不存在，但本事务曾记录其安装后指纹且无恢复意图证据，无法判断删除来源，保守拒绝。"
+              failed=1; break
+            fi
+            # 从未记录安装后指纹：视为尚未创建（安装前状态即为“不存在”，已然达成）。
+            if ! journal_set "$dir" "$src" REMOVE REMOVED "$pre" "$post"; then
+              red "恢复中止：无法持久化恢复日志（$src）。"; failed=1; break
+            fi
+            continue
+          fi
+          if [[ -n "$post" && "$cur" == "$post" ]]; then
+            : # 目标与本事务记录的安装后指纹一致，可安全移除
+          else
+            red "恢复中止：$src 无法证明由本事务创建（缺少安装后指纹或与记录不一致），拒绝删除。"
+            failed=1; break
+          fi
+          ;;
+        *)
+          red "恢复中止：$src 的恢复日志状态非法（${jstate:-空}），保守拒绝。"
+          failed=1; break
+          ;;
+      esac
+
+      if ! journal_set "$dir" "$src" REMOVE INTENT "$pre" "$post"; then
+        red "恢复中止：无法持久化恢复意图（$src）。"
+        failed=1; break
+      fi
+      if ! rm -f -- "$src"; then
+        red "恢复失败：无法安全移除 $src"
+        failed=1; break
+      fi
+      if ! fsync_path "$(dirname "$src")"; then
+        red "恢复失败：无法持久化父目录（$src）"
+        failed=1; break
+      fi
       if [[ -e "$src" || -L "$src" ]]; then
-        if ! rm -f -- "$src"; then
-          red "恢复失败：无法删除新建文件 $src"; failed=1
-        fi
+        red "恢复失败：$src 仍然存在"
+        failed=1; break
+      fi
+      if ! journal_set "$dir" "$src" REMOVE REMOVED "$pre" "$post"; then
+        red "恢复中止：无法持久化移除完成状态（$src）。"
+        failed=1; break
       fi
     fi
   done
 
-  # 删除本次新建的空目录（仅当为空时）
+  # 删除本次新建的空目录（仅当为空时；幂等）
   if [[ -f "$dirs" ]]; then
     while IFS= read -r d; do
       [[ "$d" == /* && "$d" != *..* ]] || continue
@@ -583,9 +911,9 @@ restore_transaction(){
     fi
   fi
 
-  # 对称恢复服务状态，但仅限“由本事务管理”的服务，
-  # 避免影响不属于本事务的外部服务状态。
-  # 安装前未启用则必须确保仍未启用；安装前未运行则必须确保仍未运行。
+  # 对称恢复服务状态，但仅限“由本事务管理”的服务，避免影响外部服务。
+  # 服务恢复是幂等的：目标状态始终由 state.txt 记录的安装前 active/enabled 推导，
+  # 因此恢复被中断后再次执行不会误判，也不会破坏其它服务。
   if (( xray_owned )); then
     restore_enabled "$XRAY_SERVICE" "$xe" ||
       { red "恢复失败：无法恢复 $XRAY_SERVICE 的启用状态"; failed=1; }
@@ -599,11 +927,13 @@ restore_transaction(){
       { red "恢复失败：无法恢复 $PANEL_SERVICE 的运行状态"; failed=1; }
   fi
 
-  # 校验文件恢复结果
+  # 校验文件恢复结果：安装前存在→指纹必须与安装前一致；安装前不存在→必须确实不存在
+  local cfp
   for ((i=0; i<${#S[@]}; i++)); do
-    src="${S[$i]}"; rel="${R[$i]}"; existed="${E[$i]}"
+    src="${S[$i]}"; existed="${E[$i]}"; pre="${P[$i]}"
     if [[ "$existed" == "1" ]]; then
-      [[ -e "$src" || -L "$src" ]] || { red "校验失败：$src 未恢复"; failed=1; }
+      cfp="$(file_fingerprint "$src")"
+      [[ "$cfp" == "$pre" ]] || { red "校验失败：$src 未恢复到安装前指纹"; failed=1; }
     else
       [[ ! -e "$src" && ! -L "$src" ]] || { red "校验失败：$src 仍然存在"; failed=1; }
     fi
@@ -1034,11 +1364,11 @@ verify_transaction(){
     esac
   fi
 
-  # 2) 清单路径合法性 + 3) 备份完整性 + 4) 原本不存在文件的记录
+  # 2) 清单路径合法性 + 3) 备份完整性（含内容校验）+ 4) 原本不存在文件的记录
   if [[ -f "$manifest" ]]; then
     [[ -s "$manifest" ]] || issues+=("事务清单为空：$manifest")
-    local s r e bak n=0
-    while IFS=$'\t' read -r s r e _; do
+    local s r e pre bak bfp n=0
+    while IFS=$'\t' read -r s r e pre; do
       [[ -n "${s:-}" ]] || continue
       n=$((n+1))
       if [[ "$s" != /* || "$s" == *..* || "$s" == *$'\t'* ]]; then
@@ -1050,7 +1380,15 @@ verify_transaction(){
       case "$e" in
         1)
           bak="$dir/$r"
-          [[ -e "$bak" || -L "$bak" ]] || issues+=("备份不完整：缺少 $bak")
+          if [[ ! -e "$bak" && ! -L "$bak" ]]; then
+            issues+=("备份不完整：缺少 $bak")
+          else
+            # 备份内容/类型/权限/属主必须与清单记录的安装前指纹一致，
+            # 否则视为备份被损坏或篡改，拒绝自动恢复（绝不使用损坏备份）。
+            bfp="$(file_fingerprint "$bak")"
+            [[ "$bfp" == "${pre:-}" ]] ||
+              issues+=("备份与安装前指纹不一致（可能损坏）：$bak")
+          fi
           ;;
         0)
           [[ -e "$dir/$r.absent" || -L "$dir/$r.absent" ]] ||
@@ -1491,7 +1829,10 @@ fi
 
 # 官方安装器会改写受管文件（/usr/local/bin/xray、xray.service 等）。
 # 立即持久化这些文件的安装后指纹，避免此处被强杀后无法判定其归属。
-record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE" || true
+# 指纹无法可靠落盘时立即中止，绝不在无记录的情况下继续修改受管文件。
+if ! record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE"; then
+  die "无法持久化 Xray 安装后指纹，安装中止（备份目录：$BACKUP_DIR）。"
+fi
 
 XRAY_BIN="$(command -v xray || true)"
 [[ -x "$XRAY_BIN" ]] || XRAY_BIN="/usr/local/bin/xray"
@@ -1800,11 +2141,15 @@ set_stage "8/8 最终检查"
 green "[8/8] 最终检查"
 
 # 所有受管文件均已就位，刷新安装后指纹，确保 --recover 校验覆盖全部清单条目。
-record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE"
+# 指纹记录失败必须中止：绝不在关键指纹无法可靠落盘时继续，更不得提交事务。
+if ! record_manifest_hashes "$BACKUP_DIR/$MANIFEST_FILE"; then
+  die "无法持久化受管文件的安装后指纹，安装中止（备份目录：$BACKUP_DIR）。"
+fi
 # 全部安装后指纹已记录，显式标记（与“备份清单完整”MANIFEST_COMPLETE 区分）。
 HASHES_COMPLETE=1
-state_write "IN_PROGRESS" "8/8 最终检查" ||
-  red "警告：无法写入 hashes_complete 标记（继续最终检查）。"
+if ! state_write "IN_PROGRESS" "8/8 最终检查"; then
+  die "无法持久化 hashes_complete 标记，安装中止（备份目录：$BACKUP_DIR）。"
+fi
 
 "$XRAY_BIN" run -test -config "$XRAY_CONFIG" ||
   die "Xray 最终配置检查失败。"

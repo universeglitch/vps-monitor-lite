@@ -65,6 +65,34 @@ stub_no_units(){
   groupdel(){ return 0; }
 }
 
+expect_content(){ # expect_content <描述> <文件> <期望内容>
+  local desc="$1" f="$2" want="$3" got
+  got="$(cat "$f" 2>/dev/null || true)"
+  if [[ "$got" == "$want" ]]; then ok "$desc"; else no "$desc（期望 $want，实际 ${got:-空}）"; fi
+}
+
+expect_journal_state(){ # expect_journal_state <描述> <dir> <源路径> <期望状态>
+  local desc="$1" d="$2" src="$3" want="$4" got
+  got="$(journal_state "$d" "$src")"
+  if [[ "$got" == "$want" ]]; then ok "$desc"; else no "$desc（期望 $want，实际 ${got:-空}）"; fi
+}
+
+expect_file_absent(){ # expect_file_absent <描述> <路径>
+  local desc="$1" f="$2"
+  if [[ ! -e "$f" && ! -L "$f" ]]; then ok "$desc"; else no "$desc（目标仍存在）"; fi
+}
+
+expect_file_present(){ # expect_file_present <描述> <路径>
+  local desc="$1" f="$2"
+  if [[ -e "$f" || -L "$f" ]]; then ok "$desc"; else no "$desc（目标不存在）"; fi
+}
+
+# 复制函数定义，便于在打桩同名函数时仍能调用原实现：
+#   copy_func restore_one_file real_restore_one_file
+copy_func(){
+  eval "$(declare -f "$1" | sed "1s/^[^ ]*/$2/")"
+}
+
 # =========================================================
 # T0 state_write：字段缺失 / 非法状态必须返回非 0
 # =========================================================
@@ -399,6 +427,293 @@ test_hashes_complete_flag(){
 }
 
 # =========================================================
+# T11 恢复中途被 SIGKILL → 新 Shell 断点续跑（A、B 已恢复并跳过，C 继续）
+# =========================================================
+test_interrupt_mid_recovery(){
+  echo "T11 恢复中途被中断 → 新 Shell 断点续跑"
+  lib
+  stub_no_units
+  copy_func restore_one_file real_restore_one_file
+  local d="$WORK/t11" a="$WORK/t11-a" b="$WORK/t11-b" c="$WORK/t11-c"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"; printf 'B-orig' > "$b"; printf 'C-orig' > "$c"
+  local preA preB preC
+  preA="$(file_fingerprint "$a")"; preB="$(file_fingerprint "$b")"; preC="$(file_fingerprint "$c")"
+  cp -a "$a" "$d/files/fa"; cp -a "$b" "$d/files/fb"; cp -a "$c" "$d/files/fc"
+  # 安装改写三份文件并记录安装后指纹
+  printf 'A-inst' > "$a"; printf 'B-inst' > "$b"; printf 'C-inst' > "$c"
+  {
+    printf '%s\t%s\tpost\n' "$a" "$(file_fingerprint "$a")"
+    printf '%s\t%s\tpost\n' "$b" "$(file_fingerprint "$b")"
+    printf '%s\t%s\tpost\n' "$c" "$(file_fingerprint "$c")"
+  } > "$d/hashes.tsv"
+  # 清单顺序 C,B,A → 反向遍历顺序为 A,B,C
+  {
+    printf '%s\t%s\t%s\t%s\n' "$c" "files/fc" 1 "$preC"
+    printf '%s\t%s\t%s\t%s\n' "$b" "files/fb" 1 "$preB"
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$preA"
+  } > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+
+  # 第一次运行：A、B 恢复成功后，恢复 C 前模拟 SIGKILL（INTENT 已持久化）
+  local rc=0
+  (
+    n=0
+    # shellcheck disable=SC2317  # 由 restore_transaction 间接调用
+    restore_one_file(){
+      n=$((n+1))
+      (( n >= 3 )) && exit 137
+      real_restore_one_file "$@"
+    }
+    restore_transaction "$d" 1
+  ) || rc=$?
+  if (( rc != 0 )); then ok "首次运行被中断（返回非 0）"; else no "首次运行未被中断"; fi
+  expect_journal_state "A 日志为 RESTORED" "$d" "$a" "RESTORED"
+  expect_journal_state "B 日志为 RESTORED" "$d" "$b" "RESTORED"
+  expect_journal_state "C 日志停留在 INTENT" "$d" "$c" "INTENT"
+
+  # 新 Shell 再次执行：已恢复的 A、B 必须跳过，C 继续
+  expect_ok "中断后再次恢复成功" restore_transaction "$d" 1
+  expect_content "A 恢复为安装前内容" "$a" "A-orig"
+  expect_content "B 恢复为安装前内容" "$b" "B-orig"
+  expect_content "C 恢复为安装前内容" "$c" "C-orig"
+  if [[ "$(journal_state "$d" "$a")" == "RESTORED" &&
+        "$(journal_state "$d" "$b")" == "RESTORED" &&
+        "$(journal_state "$d" "$c")" == "RESTORED" ]]; then
+    ok "全部文件日志为 RESTORED"
+  else
+    no "存在未标记 RESTORED 的文件"
+  fi
+  expect_file_present "备份 fa 保留" "$d/files/fa"
+  expect_file_present "备份 fb 保留" "$d/files/fb"
+  expect_file_present "备份 fc 保留" "$d/files/fc"
+}
+
+# =========================================================
+# T12 原子替换前中断：INTENT 已写、临时文件未替换正式目标 → 安全重试
+# =========================================================
+test_interrupt_before_atomic_replace(){
+  echo "T12 原子替换前中断 → 安全重试"
+  lib
+  stub_no_units
+  local d="$WORK/t12" a="$WORK/t12-a"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'A-inst' > "$a"
+  local post; post="$(file_fingerprint "$a")"
+  printf '%s\t%s\tpost\n' "$a" "$post" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre" > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  # 模拟：已持久化恢复意图，但正式替换尚未发生，且遗留半截临时文件
+  expect_ok "写入 INTENT 日志" journal_set "$d" "$a" RESTORE INTENT "$pre" "$post"
+  printf 'partial-temp' > "$(dirname "$a")/.node-panel-restore.12345.6789"
+
+  expect_ok "再次恢复安全重试成功" restore_transaction "$d" 1
+  expect_content "目标恢复为安装前内容" "$a" "A-orig"
+  expect_journal_state "日志更新为 RESTORED" "$d" "$a" "RESTORED"
+  if compgen -G "$(dirname "$a")/.node-panel-restore.*" >/dev/null; then
+    no "遗留临时文件未清理"
+  else
+    ok "遗留临时文件已清理"
+  fi
+  expect_file_present "备份保留" "$d/files/fa"
+}
+
+# =========================================================
+# T13 原子替换后、RESTORED 写入前中断：目标已是安装前状态、日志停留 INTENT
+#     再次恢复须依安装前指纹识别已完成替换，直接补记 RESTORED（不重复替换）
+# =========================================================
+test_interrupt_after_replace_before_journal(){
+  echo "T13 原子替换后、RESTORED 写入前中断 → 补记 RESTORED"
+  lib
+  stub_no_units
+  local d="$WORK/t13" a="$WORK/t13-a"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'A-inst' > "$a"
+  local post; post="$(file_fingerprint "$a")"
+  printf '%s\t%s\tpost\n' "$a" "$post" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre" > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  # 正式目标已恢复为安装前内容，但恢复日志仍停留在 INTENT
+  printf 'A-orig' > "$a"
+  expect_ok "写入 INTENT 日志" journal_set "$d" "$a" RESTORE INTENT "$pre" "$post"
+  # 若错误地重跑替换会调用 restore_one_file；令其失败以证明未重跑
+  restore_one_file(){ return 9; }
+
+  expect_ok "再次恢复成功（识别已完成替换）" restore_transaction "$d" 1
+  expect_content "目标内容保持安装前" "$a" "A-orig"
+  expect_journal_state "日志补记为 RESTORED" "$d" "$a" "RESTORED"
+}
+
+# =========================================================
+# T14 恢复过程中 B 被外部修改 → 保留 A、不覆盖 B、不盲目覆盖 C
+# =========================================================
+test_external_modify_during_recovery(){
+  echo "T14 恢复过程中外部修改 → 保留 A、不覆盖 B、不盲改 C"
+  lib
+  stub_no_units
+  local d="$WORK/t14" a="$WORK/t14-a" b="$WORK/t14-b" c="$WORK/t14-c"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"; printf 'B-orig' > "$b"; printf 'C-orig' > "$c"
+  local preA preB preC
+  preA="$(file_fingerprint "$a")"; preB="$(file_fingerprint "$b")"; preC="$(file_fingerprint "$c")"
+  cp -a "$a" "$d/files/fa"; cp -a "$b" "$d/files/fb"; cp -a "$c" "$d/files/fc"
+  printf 'A-inst' > "$a"; printf 'B-inst' > "$b"; printf 'C-inst' > "$c"
+  local postA postB postC
+  postA="$(file_fingerprint "$a")"; postB="$(file_fingerprint "$b")"; postC="$(file_fingerprint "$c")"
+  {
+    printf '%s\t%s\tpost\n' "$a" "$postA"
+    printf '%s\t%s\tpost\n' "$b" "$postB"
+    printf '%s\t%s\tpost\n' "$c" "$postC"
+  } > "$d/hashes.tsv"
+  # 清单顺序 C,B,A → 反向遍历顺序为 A,B,C
+  {
+    printf '%s\t%s\t%s\t%s\n' "$c" "files/fc" 1 "$preC"
+    printf '%s\t%s\t%s\t%s\n' "$b" "files/fb" 1 "$preB"
+    printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$preA"
+  } > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  # A 已成功恢复（内容==安装前 + 日志 RESTORED）
+  printf 'A-orig' > "$a"
+  expect_ok "写入 A 为 RESTORED" journal_set "$d" "$a" RESTORE RESTORED "$preA" "$postA"
+  # B 被外部修改（既非安装前、也非已记录的安装后指纹）
+  printf 'B-external' > "$b"
+  # C 保持安装后状态，尚未恢复
+
+  expect "再次恢复必须拒绝（B 外部修改）" restore_transaction "$d" 1
+  expect_content "A 保持已恢复内容" "$a" "A-orig"
+  expect_content "B 外部修改未被覆盖" "$b" "B-external"
+  expect_content "C 未被盲目覆盖" "$c" "C-inst"
+  expect_journal_state "A 日志保持 RESTORED" "$d" "$a" "RESTORED"
+  expect_file_present "备份 fa 保留" "$d/files/fa"
+  expect_file_present "备份 fb 保留" "$d/files/fb"
+  expect_file_present "备份 fc 保留" "$d/files/fc"
+}
+
+# =========================================================
+# T15 备份损坏（内容被改写）→ 拒绝恢复、不覆盖目标、不删除备份
+# =========================================================
+test_corrupt_backup(){
+  echo "T15 备份损坏 → 拒绝恢复且不覆盖目标"
+  lib
+  stub_no_units
+  local d="$WORK/t15" a="$WORK/t15-a"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'A-inst' > "$a"
+  printf '%s\t%s\tpost\n' "$a" "$(file_fingerprint "$a")" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre" > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  # 备份内容被破坏（追加内容，指纹改变）
+  printf 'CORRUPT' >> "$d/files/fa"
+
+  expect "备份损坏 → verify_transaction 拒绝" verify_transaction "$d"
+  expect "备份损坏 → restore_transaction 拒绝" restore_transaction "$d" 1
+  expect_content "目标未被覆盖（仍为安装后内容）" "$a" "A-inst"
+  expect_file_present "损坏备份仍保留（未被删除）" "$d/files/fa"
+}
+
+# =========================================================
+# T16 备份权限/属主被修改（内容不变）→ 按指纹规则拒绝恢复
+# =========================================================
+test_backup_perm_changed(){
+  echo "T16 备份权限变化 → 拒绝恢复"
+  lib
+  stub_no_units
+  local d="$WORK/t16" a="$WORK/t16-a"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"; chmod 600 "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'A-inst' > "$a"
+  printf '%s\t%s\tpost\n' "$a" "$(file_fingerprint "$a")" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre" > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  expect_ok "备份完好时 verify_transaction 通过" verify_transaction "$d"
+  chmod 644 "$d/files/fa"
+  expect "备份权限变化 → verify_transaction 拒绝" verify_transaction "$d"
+  expect "备份权限变化 → restore_transaction 拒绝" restore_transaction "$d" 1
+  expect_content "目标未被覆盖" "$a" "A-inst"
+  expect_file_present "备份保留" "$d/files/fa"
+}
+
+# =========================================================
+# T17 持久化失败（恢复日志写入失败 / fsync 失败）→ 停止危险操作、不误报成功
+# =========================================================
+test_persistence_failure(){
+  echo "T17 持久化失败 → 停止危险操作、不误报成功"
+  lib
+  stub_no_units
+  local d="$WORK/t17" a="$WORK/t17-a"
+  mkdir -p "$d/files"
+  printf 'A-orig' > "$a"
+  local pre; pre="$(file_fingerprint "$a")"
+  cp -a "$a" "$d/files/fa"
+  printf 'A-inst' > "$a"
+  printf '%s\t%s\tpost\n' "$a" "$(file_fingerprint "$a")" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$a" "files/fa" 1 "$pre" > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+
+  # 场景 1：恢复日志写入失败
+  journal_set(){ return 1; }
+  expect "恢复日志写入失败 → 恢复中止（非 0）" restore_transaction "$d" 1
+  expect_content "写入失败时目标未被修改" "$a" "A-inst"
+  expect_journal_state "未产生错误的恢复日志" "$d" "$a" ""
+
+  # 场景 2：fsync 持久化失败
+  lib; stub_no_units
+  fsync_path(){ return 1; }
+  expect "fsync 失败 → 恢复中止（非 0）" restore_transaction "$d" 1
+  expect_content "fsync 失败时目标未被修改" "$a" "A-inst"
+  expect_journal_state "fsync 失败未留下半写日志" "$d" "$a" ""
+}
+
+# =========================================================
+# T18 原本不存在的文件：移除后、REMOVED 写入前中断
+#     有证据（持久化 INTENT + 安装后指纹）→ 幂等续跑；
+#     无证据（INTENT 缺少安装后指纹）→ 保守拒绝，不猜测
+# =========================================================
+test_nonexistent_removal_interrupt(){
+  echo "T18 原本不存在文件移除中断 → 依证据判定续跑或拒绝"
+  lib
+  stub_no_units
+  # 场景 a：有安装后指纹证据
+  local d="$WORK/t18" c="$WORK/t18-c"
+  mkdir -p "$d/files"
+  : > "$d/files/fc.absent"
+  printf 'C-inst' > "$c"
+  local post; post="$(file_fingerprint "$c")"
+  printf '%s\t%s\tpost\n' "$c" "$post" > "$d/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$c" "files/fc" 0 "MISSING" > "$d/manifest.tsv"
+  write_state "$d" ROLLBACK_IN_PROGRESS 1 1
+  rm -f "$c"   # 已安全移除，但 REMOVED 尚未写入
+  expect_ok "写入 INTENT（含安装后指纹证据）" journal_set "$d" "$c" REMOVE INTENT "MISSING" "$post"
+  expect_ok "有证据时续跑成功" restore_transaction "$d" 1
+  expect_journal_state "日志标记 REMOVED" "$d" "$c" "REMOVED"
+  expect_file_absent "目标确实不存在" "$c"
+
+  # 场景 b：无安装后指纹证据 → 保守拒绝
+  lib; stub_no_units
+  local d2="$WORK/t18b" c2="$WORK/t18b-c"
+  mkdir -p "$d2/files"
+  : > "$d2/files/fc.absent"
+  : > "$d2/hashes.tsv"
+  printf '%s\t%s\t%s\t%s\n' "$c2" "files/fc" 0 "MISSING" > "$d2/manifest.tsv"
+  write_state "$d2" ROLLBACK_IN_PROGRESS 1 1
+  expect_ok "写入 INTENT（无安装后指纹证据）" journal_set "$d2" "$c2" REMOVE INTENT "MISSING" ""
+  expect "无证据时拒绝续跑" restore_transaction "$d2" 1
+  expect_journal_state "未错误标记 REMOVED" "$d2" "$c2" "INTENT"
+  expect_file_absent "目标确实不存在（未误判为成功）" "$c2"
+}
+
+# =========================================================
 echo "=================================================="
 echo " install-dual.sh 恢复安全机制测试"
 echo "=================================================="
@@ -414,6 +729,14 @@ test_interrupted_install_recover
 test_interrupted_then_external_modify
 test_unrecorded_change_conservative
 test_hashes_complete_flag
+test_interrupt_mid_recovery
+test_interrupt_before_atomic_replace
+test_interrupt_after_replace_before_journal
+test_external_modify_during_recovery
+test_corrupt_backup
+test_backup_perm_changed
+test_persistence_failure
+test_nonexistent_removal_interrupt
 echo "--------------------------------------------------"
 printf '结果：\033[32m%d 通过\033[0m，\033[31m%d 失败\033[0m\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
