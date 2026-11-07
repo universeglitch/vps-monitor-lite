@@ -306,6 +306,7 @@ NODEPANEL_WAS_ACTIVE="$(svc_active node-panel && echo 1 || echo 0)"
 NODEPANEL_WAS_ENABLED="$(svc_enabled node-panel && echo 1 || echo 0)"
 
 track_file "$XRAY_CONFIG" "files/xray-config.json"
+track_file "${XRAY_CONFIG}.new" "files/xray-config.json.new"
 track_file "$PANEL_FILE" "files/panel.py"
 track_file "$PANEL_CONFIG" "files/panel-config.json"
 track_file "$AUTH_FILE" "files/auth.json"
