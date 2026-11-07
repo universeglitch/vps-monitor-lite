@@ -286,6 +286,7 @@ track_file "/usr/local/lib/systemd/system/xray.service" "files/xray-local.servic
 track_file "/usr/local/lib/systemd/system/xray@.service" "files/xray-local-template.service"
 track_file "/lib/systemd/system/xray.service" "files/xray-lib.service"
 track_file "/lib/systemd/system/xray@.service" "files/xray-lib-template.service"
+track_file "/usr/local/bin/xray" "files/xray-bin"
 
 cat > "$BACKUP_DIR/state.txt" <<EOF
 stamp=$STAMP
