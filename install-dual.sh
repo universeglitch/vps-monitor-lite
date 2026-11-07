@@ -390,9 +390,11 @@ yellow "事务备份完成：$BACKUP_DIR"
 green "[1/8] 安装依赖"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
+apt-get update || die "APT 软件包索引更新失败。"
+
 apt-get install -y --no-install-recommends \
-  ca-certificates curl openssl python3 python3-qrcode python3-pil iproute2
+  ca-certificates curl openssl python3 python3-qrcode python3-pil iproute2 \
+  || die "系统依赖安装失败。"
 # ------------------- 安装前端口占用检查 -------------------
 
 for p in "$WS_PORT" "$REALITY_PORT" "$PANEL_PORT"; do
