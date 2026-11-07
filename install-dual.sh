@@ -562,8 +562,8 @@ cfg = {
 }
 
 path = Path(output)
-tmp = path.with_suffix(".json.new")
 tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+tmp.chmod(0o600)
 tmp.replace(path)
 PY
 
