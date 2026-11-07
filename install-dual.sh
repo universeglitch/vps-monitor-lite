@@ -82,7 +82,22 @@ rollback_all(){
   yellow "正在回滚本次安装……"
   systemctl stop node-panel.service >/dev/null 2>&1 || true
   systemctl stop xray.service >/dev/null 2>&1 || true
-    # 清理本次安装创建的 Xray 用户和用户组
+  
+  for ((i=${#TRACK_SRC[@]}-1; i>=0; i--)); do
+    src="${TRACK_SRC[$i]}"; bak="${TRACK_BAK[$i]}"
+    if [[ -f "$bak.absent" ]]; then
+      if ! rm -f -- "$src"; then
+        red "回滚失败：无法删除新建文件 $src"; failed=1
+      fi
+    elif [[ -e "$bak" || -L "$bak" ]]; then
+      if ! mkdir -p "$(dirname "$src")" || ! cp -a --remove-destination "$bak" "$src"; then
+        red "回滚失败：无法恢复 $src"; failed=1
+      fi
+    fi
+  done
+
+  systemctl daemon-reload >/dev/null 2>&1 || failed=1
+  # 清理本次安装创建的 Xray 用户和用户组
   if getent passwd xray >/dev/null 2>&1; then
     if ! xray_pids="$(ps -u xray -o pid= 2>/dev/null)"; then
       red "回滚失败：无法检查 Xray 用户进程"
@@ -104,20 +119,6 @@ rollback_all(){
       failed=1
     fi
   fi
-  for ((i=${#TRACK_SRC[@]}-1; i>=0; i--)); do
-    src="${TRACK_SRC[$i]}"; bak="${TRACK_BAK[$i]}"
-    if [[ -f "$bak.absent" ]]; then
-      if ! rm -f -- "$src"; then
-        red "回滚失败：无法删除新建文件 $src"; failed=1
-      fi
-    elif [[ -e "$bak" || -L "$bak" ]]; then
-      if ! mkdir -p "$(dirname "$src")" || ! cp -a --remove-destination "$bak" "$src"; then
-        red "回滚失败：无法恢复 $src"; failed=1
-      fi
-    fi
-  done
-
-  systemctl daemon-reload >/dev/null 2>&1 || failed=1
 
   # 恢复 Xray 原来的启用状态
   if [[ "$XRAY_WAS_ENABLED" == "1" ]]; then
