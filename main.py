@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 from active import Active, ServiceError
 from auth import Auth, AuthError, BackupPending, Busy, Corrupt, loads, b64, unb64
-from function import Coordinator, Memory, ResourceGate, PanelBackend, Discovery, XrayTransaction, XraySelfTest, BoundedCommand
+from function import Coordinator, Memory, ResourceGate, PanelBackend, Discovery, XrayTransaction, XraySelfTest, BoundedCommand, ModuleInstaller
 
 PAGE = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VPS Monitor</title>
 <style>*{box-sizing:border-box}body{margin:0;color:#eef0ff;font:16px system-ui;background:linear-gradient(145deg,#0c1938,#26143d);min-height:100vh}body{opacity:1;transition:opacity .3s ease-in-out}body.switching{opacity:0}main{max-width:620px;margin:32px auto;padding:20px}header{padding:24px;border-radius:22px;background:linear-gradient(120deg,#2163aa,#6542b0)}section{background:#141a34cc;border:1px solid #ffffff12;border-radius:20px;padding:20px;margin-top:18px;backdrop-filter:blur(12px)}.row{display:flex;justify-content:space-between;align-items:center;padding:14px 0;gap:12px}.switch{width:54px;height:30px;border-radius:20px;background:#414466;position:relative;transition:background .3s ease-in-out}.switch:after{content:'';position:absolute;width:22px;height:22px;left:4px;top:4px;border-radius:50%;background:white;transition:transform .3s ease-in-out}.switch.on{background:#35ac73}.switch.on:after{transform:translateX(24px)}button{color:inherit;background:#413578;border:0;border-radius:12px;padding:12px;cursor:pointer}button:active{transform:scale(.98)}button:disabled{opacity:.5;cursor:not-allowed}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.all{display:flex;align-items:center;flex-direction:column;gap:10px;color:#6cb8ff}.all .switch{background:#814fc1}input,select{display:block;width:100%;padding:12px;margin:10px 0;border:1px solid #454969;border-radius:10px;background:#11172e;color:white}dialog{width:min(90vw,430px);background:#18213e;color:white;border:1px solid #58508a;border-radius:18px}dialog::backdrop{background:#0009}#notice{white-space:pre-wrap;font-size:14px;color:#f5cd8e}small{color:#aeb9d4}.secret{overflow-wrap:anywhere}</style>
@@ -125,8 +125,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Host') != urlsplit(self.server.origin).netloc:
                 raise AuthError('unexpected Host')
             if self.path == '/':
-                import panel
-                script=panel.render_components()[2]
+                try:
+                    import panel
+                    script=panel.render_components()[2]
+                except ImportError:
+                    script="bridge.expired();throw Error('详细面板尚未安装')"
                 entry=PAGE.replace('<script>', '<script>function mountDetailed(root,bridge){'+script+'}\n',1)
                 return self.reply(200,entry,html=True)
             token=self.token(); self.server.coordinator.auth.validate(token)
@@ -182,7 +185,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/ports':return self.reply(200,{'ports':backend.ports(token)})
             if self.path == '/cloud-guide':return self.reply(200,backend.guide(token))
             if self.path == '/detail':return self.reply(200,backend.detail(token,data.get('action'),self.headers))
-            if self.path == '/module/install':return self.reply(200,c.install(token,data.get('service'),data.get('confirmation')))
+            if self.path == '/module/install':
+                installer=getattr(self.server,'module_installer',None)
+                if installer is None:raise AuthError('isolated installer runner unavailable')
+                result=installer.execute(token,data['confirmation']) if data.get('confirmation') else installer.prepare(token,data.get('service'))
+                return self.reply(200,result)
             if self.path == '/service/prepare':return self.reply(200,backend.prepare_service(token,data.get('id'),data.get('enabled')))
             if self.path == '/service/apply':return self.reply(200,backend.apply_service(token,data.get('confirmation')))
             if self.path == '/xray/schema':return self.reply(200,backend.schema(token,data.get('kind')))
@@ -301,6 +308,7 @@ def cli():
                 raise ServiceError('Cloudflared executable/config validation not certified for this version')
         active.readiness=readiness
         server=Server((args.bind,args.port),Handler,coordinator,args.origin)
+        server.module_installer=ModuleInstaller(server.panel_backend,runner)
         try: server.serve_forever()
         finally: server.server_close()
     finally:

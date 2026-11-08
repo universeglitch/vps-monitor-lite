@@ -83,3 +83,32 @@ class PanelTests(unittest.TestCase):
         before=self.metadata.read_bytes();d=self.backend.guide(self.token)
         self.assertIn('example.test -> HTTP -> 127.0.0.1:19191',d['ws_rule'])
         self.assertIn('18999',d['panel_rule']);self.assertEqual(before,self.metadata.read_bytes())
+
+class InstallerTests(PanelTests):
+    def test_panel_install_confirmation_required(self):
+        from function import ModuleInstaller
+        installer=ModuleInstaller(self.backend,None,self.root)
+        p=installer.prepare(self.token,'panel')
+        self.assertIn('raw.githubusercontent.com',p['source'])
+        self.assertEqual(len(p['sha256']),64)
+        with self.assertRaises(AuthError):installer.execute(self.token,'not-a-permit')
+    def test_download_host_rejected(self):
+        from function import ModuleInstaller
+        installer=ModuleInstaller(self.backend,None,self.root)
+        with self.assertRaises(AuthError):installer._download('http://attacker.test/payload',self.root/'asset',10)
+    def test_checksum_mismatch_no_install(self):
+        from function import ModuleInstaller
+        installer=ModuleInstaller(self.backend,None,self.root)
+        def download(url,path,limit):path.write_bytes(b'corrupt')
+        installer._download=download
+        permit=self.backend._permit(self.token,{'op':'install','release':{'name':'panel','url':'https://raw.githubusercontent.com/x','digest':'0'*64,'asset':'panel.py'}})
+        with self.assertRaises(AuthError):installer.execute(self.token,permit)
+    def test_cancel_config_does_not_write_disabled_state(self):
+        from auth import dumps
+        self.a.store.write('xray-owned.json',dumps(['vps-monitor-ws']))
+        before=self.config.read_bytes()
+        p=self.backend.prepare_service(self.token,'ws',False)
+        self.assertIn('confirmation',p)
+        self.assertEqual(before,self.config.read_bytes())
+        self.assertIsNone(self.a.store.read('disabled-inbounds.json',missing=True))
+        self.assertEqual(self.service.calls,[])

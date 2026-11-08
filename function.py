@@ -679,7 +679,7 @@ class PanelBackend:
         if action=='visitor':
             class Request:pass
             req=Request();req.headers=headers
-            return panel.get_visitor_info(req)
+            with self.c.gate('diagnostics'):return panel.get_visitor_info(req)
         if action=='serverdiag':
             with self.c.gate('diagnostics'):return panel.get_server_diagnostics()
         if action=='status':
@@ -895,3 +895,129 @@ class PanelBackend:
             from auth import dumps
             self.store.write('disabled-inbounds.json',dumps(r['disabled_after']))
         return result
+
+
+class ModuleInstaller:
+    """Built-in official release sources; no remotely downloaded shell execution.
+
+    Release asset must have GitHub's sha256 digest; releases lacking it are refused.
+    Programs install without rewriting existing files, unit or user configuration.
+    Missing unit/config remains visible as incomplete, never reported ready.
+    """
+    SOURCES={'xray':('XTLS/Xray-core','Xray-linux-64.zip','Xray-linux-arm64-v8a.zip'),
+             'cloudflared':('cloudflare/cloudflared','cloudflared-linux-amd64','cloudflared-linux-arm64')}
+    PANEL_SHA256='214fcbc66f104aa7fbe6caea2f4e3c7ff6f9ee5c00134dcf9eb447daaebba771'
+    LIMIT=50*1024*1024
+
+    def __init__(self, backend, runner, program_dir=Path('/usr/local/bin')):
+        self.backend,self.c,self.runner=backend,backend.c,runner
+        self.program_dir=Path(program_dir)
+
+    def _download(self,url,destination,limit):
+        import urllib.request,urllib.parse
+        parsed=urllib.parse.urlsplit(url)
+        if parsed.scheme!='https' or parsed.hostname not in ('api.github.com','github.com','raw.githubusercontent.com'):
+            raise AuthError('untrusted module source')
+        req=urllib.request.Request(url,headers={'User-Agent':'vps-monitor-lite/1.0','Accept':'application/vnd.github+json'})
+        # urllib redirect targets must also be HTTPS; GitHub release assets use
+        # release-assets.githubusercontent.com, never arbitrary redirect origins.
+        class Redirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self,req,fp,code,msg,headers,newurl):
+                target=urllib.parse.urlsplit(newurl)
+                if target.scheme!='https' or target.hostname not in ('github.com','api.github.com','raw.githubusercontent.com','release-assets.githubusercontent.com','objects.githubusercontent.com'):
+                    raise AuthError('untrusted download redirect')
+                return super().redirect_request(req,fp,code,msg,headers,newurl)
+        opener=urllib.request.build_opener(Redirect())
+        total=0;deadline=time.monotonic()+90
+        with opener.open(req,timeout=10) as response,open(destination,'xb') as output:
+            os.chmod(destination,0o600)
+            while True:
+                self.c.gate.checkpoint()
+                if time.monotonic()>deadline:raise Busy('module download timeout')
+                raw=response.read(min(65536,limit-total+1))
+                if not raw:break
+                total+=len(raw)
+                if total>limit:raise AuthError('module download size limit')
+                output.write(raw)
+            output.flush();os.fsync(output.fileno())
+        if total==0:raise AuthError('empty module download')
+
+    def prepare(self,token,name):
+        import platform,tempfile,hashlib
+        from auth import loads
+        self.c.auth.validate(token)
+        if name in ('ws','xhttp','reality'):name='xray'
+        if name not in (*self.SOURCES,'panel'):raise AuthError('unsupported module')
+        if name=='panel':
+            # Match the reviewed integration revision, never fetch mutable main.
+            release={'name':name,'url':'https://raw.githubusercontent.com/universeglitch/vps-monitor-lite/b090bc233945d7c436c1e692b72265b139488478/panel.py',
+                     'digest':self.PANEL_SHA256,'asset':'panel.py'}
+        else:
+            arch=platform.machine()
+            if arch not in ('x86_64','aarch64'):raise AuthError('unsupported CPU architecture')
+            repo,amd,arm=self.SOURCES[name];asset=amd if arch=='x86_64' else arm
+            with self.c.gate('module-metadata'),tempfile.TemporaryDirectory(prefix='vps-module-meta-') as tmp:
+                path=Path(tmp)/'release.json';self._download('https://api.github.com/repos/'+repo+'/releases/latest',path,262144)
+                metadata=loads(path.read_bytes())
+            matches=[a for a in metadata.get('assets',[]) if a.get('name')==asset]
+            if len(matches)!=1:raise AuthError('official release asset missing')
+            a=matches[0];digest=a.get('digest','')
+            if not __import__('re').fullmatch('sha256:[0-9a-f]{64}',digest):raise AuthError('official release lacks verifiable SHA256 digest')
+            if type(a.get('size')) is not int or not 0<a['size']<=self.LIMIT:raise AuthError('release size unsupported')
+            release={'name':name,'url':a['browser_download_url'],'digest':digest[7:],'asset':asset,'version':metadata.get('tag_name')}
+        permit=self.backend._permit(token,{'op':'install','release':release})
+        return {'confirmation':permit,'missing':['module components'],'source':release['url'],'version':release.get('version'),'sha256':release['digest'],
+                'warning':'只安装已校验模块，不覆盖配置或旧服务；缺少 systemd unit/配置时仍需完成配置，安装不会自动启动代理。'}
+
+    def execute(self,token,confirmation):
+        import tempfile,hashlib,zipfile,shutil,stat
+        r=self.backend._consume(token,confirmation)
+        if r['op']!='install':raise AuthError('confirmation type mismatch')
+        release=r['release'];name=release['name']
+        with self.c.gate('install-'+name),tempfile.TemporaryDirectory(prefix='vps-module-') as tmp:
+            if shutil.disk_usage(self.program_dir if name!='panel' else Path(__file__).parent).free < self.LIMIT*3:
+                raise Busy('insufficient staging/rollback disk margin')
+            archive=Path(tmp)/'asset';self._download(release['url'],archive,self.LIMIT if name!='panel' else 262144)
+            with open(archive,'rb') as downloaded:
+                digest=hashlib.file_digest(downloaded,'sha256').hexdigest()
+            if digest!=release['digest']:raise AuthError('module SHA256 mismatch')
+            source=archive
+            if name=='xray':
+                with zipfile.ZipFile(archive) as z:
+                    entries=[i for i in z.infolist() if i.filename=='xray']
+                    if len(entries)!=1 or not 0<entries[0].file_size<=self.LIMIT:raise AuthError('invalid Xray archive')
+                    item=entries[0]
+                    if stat.S_ISLNK(item.external_attr>>16):raise AuthError('archive link rejected')
+                    source=Path(tmp)/'binary'
+                    with z.open(item) as inp,open(source,'xb') as out:
+                        size=0
+                        while True:
+                            raw=inp.read(65536)
+                            if not raw:break
+                            size+=len(raw)
+                            if size>self.LIMIT:raise AuthError('extracted size limit')
+                            self.c.gate.checkpoint();out.write(raw)
+                        out.flush();os.fsync(out.fileno())
+            if name=='panel':
+                compile(source.read_text(), 'downloaded-panel.py','exec')
+                target=Path(__file__).with_name('panel.py')
+            else:
+                os.chmod(source,0o700)
+                self.runner.run([str(source),'version' if name=='xray' else '--version'],timeout=15)
+                target=self.program_dir/name
+            # Never clobber an existing binary, config or currently imported module.
+            if target.exists() or target.is_symlink():raise AuthError('module path exists; refusing overwrite')
+            fd,staged=tempfile.mkstemp(prefix='.vps-module-',dir=target.parent)
+            try:
+                with os.fdopen(fd,'wb',closefd=False) as out,open(source,'rb') as inp:
+                    shutil.copyfileobj(inp,out,65536);out.flush();os.fchmod(fd,0o644 if name=='panel' else 0o755);os.fsync(fd)
+                os.link(staged,target,follow_symlinks=False)
+                d=os.open(target.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                try:os.fsync(d)
+                finally:os.close(d)
+            finally:
+                os.close(fd);os.unlink(staged)
+            if name=='panel':return {'program_installed':True,'restart_management_required':True,'ready':False}
+            # Actual version test + presence checks; missing units/config are not success.
+            check=self.c.discovery.inspect(name)
+            return {'program_installed':True,'ready':False,'discovery':check,'next':'配置/unit 就绪及启动验证后才可出现在正常服务列表'}
