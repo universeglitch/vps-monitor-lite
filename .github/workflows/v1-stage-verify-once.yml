@@ -5,6 +5,9 @@ on:
     paths: [.github/workflows/v1-stage-verify-once.yml]
 permissions:
   contents: write
+concurrency:
+  group: v1-stage-verification
+  cancel-in-progress: true
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -18,13 +21,11 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install -r requirements-v1.txt
-      - name: Close unsafe bypasses and optimized-Python validation gaps
+      - name: Targeted validation fixes
         run: |
           python - <<'PY'
           from pathlib import Path
-          p=Path('auth.py'); s=p.read_text()
-          # Security validation must not disappear under python -O.
-          lines=[]
+          p=Path('auth.py'); s=p.read_text(); lines=[]
           for line in s.splitlines():
               if line.lstrip().startswith('assert '):
                   indent=line[:len(line)-len(line.lstrip())]
@@ -33,22 +34,15 @@ jobs:
               lines.append(line)
           p.write_text('\n'.join(lines)+'\n')
           p=Path('function.py'); s=p.read_text()
-          old="        return self.active.set_service(service, enabled)"
+          old='        return self.active.set_service(service, enabled)'
           assert s.count(old)==1
           s=s.replace(old,"        if enabled is True:\n            raise AuthError('start refused: configuration readiness validation not yet enabled')\n"+old)
           p.write_text(s)
           p=Path('main.py'); s=p.read_text()
-          s=s.replace("profile=loads(f.read(262145))", "profile=loads(f.read(262145))")
           old="    gate=ResourceGate(Memory(),profile['profiles'],profile['reserve'])"
           assert s.count(old)==1
-          new="""    if (not isinstance(profile,dict) or not isinstance(profile.get('profiles'),dict) or
-                  type(profile.get('reserve')) is not int or profile['reserve'] <= 0 or
-                  any(type(v) is not int or v <= 0 or v >= 200_000_000 for v in profile['profiles'].values())):
-              p.error('positive measured byte profiles and reserve required')
-          gate=ResourceGate(Memory(),profile['profiles'],profile['reserve'])"""
-          # Keep source indentation: replacement first line already has four spaces.
-          s=s.replace(old,new)
-          p.write_text(s)
+          new="    if (not isinstance(profile,dict) or not isinstance(profile.get('profiles'),dict) or\n        type(profile.get('reserve')) is not int or profile['reserve'] <= 0 or\n        any(type(v) is not int or v <= 0 or v >= 200_000_000 for v in profile['profiles'].values())):\n        p.error('positive measured byte profiles and reserve required')\n"+old
+          p.write_text(s.replace(old,new))
           PY
       - name: Syntax and actual isolated unit tests
         shell: bash
@@ -71,7 +65,7 @@ jobs:
           name: v1-stage-evidence
           path: ${{ runner.temp }}/v1-evidence/
           if-no-files-found: warn
-      - name: Commit verified corrections and test evidence
+      - name: Commit verified corrections and evidence
         shell: bash
         run: |
           set -euo pipefail
@@ -79,19 +73,16 @@ jobs:
           import os,pathlib,subprocess
           e=pathlib.Path(os.environ['RUNNER_TEMP'])/'v1-evidence'
           logs='\n'.join((e/n).read_text() for n in ('unittest.log','optimized.log'))
-          root=pathlib.Path('tests/V1_STAGE_EVIDENCE.md')
           url='https://github.com/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+os.environ['GITHUB_RUN_ID']
-          root.write_text('# V1 staged verification\n\nGitHub Ubuntu runner, Python 3.11. Not a target VPS, no memory-peak acceptance.\n\nInput commit: `'+subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()+'`\n\nRun: '+url+'\n\nCommands: `python -m py_compile auth.py function.py active.py main.py`; `python -m unittest discover -s tests -p test_*v1.py -v`; `python -O -m unittest discover -s tests -p test_auth_v1.py -v`; `git diff --check`.\n\nFrozen panel/install/update/systemd blobs verified against baseline.\n\n```text\n'+logs+'\n```\n')
-          readme=pathlib.Path('README.md')
-          text=readme.read_text()
-          section='\n## V1.0 plus 开发状态\n\n新管理模块正在 plus 分支分阶段实现，尚非完整生产版本。现有 panel.py、安装/更新脚本与旧 systemd 服务保持冻结。详见 [实现范围与未完成项](V1_DEVELOPMENT.md) 和 [实际隔离测试证据](tests/V1_STAGE_EVIDENCE.md)。测试仅为 GitHub Runner 单元测试，不能代替 200,000,000 bytes、无 Swap 的真实代理负载验收。没有运行真实安装或服务操作。\n'
-          assert '## V1.0 plus 开发状态' not in text
-          readme.write_text(text+section)
+          pathlib.Path('tests/V1_STAGE_EVIDENCE.md').write_text('# V1 staged verification\n\nGitHub Ubuntu runner, Python 3.11. No target VPS or memory-peak acceptance.\n\nInput commit: `'+subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()+'`\n\nRun: '+url+'\n\nCommands: py_compile all four new modules; unittest discovery test_*v1.py; optimized-Python test_auth_v1.py; git diff --check.\n\nFrozen panel/install/update/systemd blobs verified against baseline.\n\n```text\n'+logs+'\n```\n')
+          p=pathlib.Path('README.md'); s=p.read_text()
+          assert '## V1.0 plus 开发状态' not in s
+          p.write_text(s+'\n## V1.0 plus 开发状态\n\n新管理模块正在 plus 分支分阶段实现，尚非完整生产版本。panel.py、旧安装/更新脚本及旧 systemd 服务保持冻结。详见 [实现范围与未完成项](V1_DEVELOPMENT.md) 和 [实际隔离测试证据](tests/V1_STAGE_EVIDENCE.md)。GitHub Runner 单元测试不代替 200,000,000 bytes、无 Swap 的真实代理负载验收。\n')
           PY
           git rm .github/workflows/v1-stage-verify-once.yml
           git add auth.py function.py main.py README.md tests/V1_STAGE_EVIDENCE.md
           git diff --cached --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix(v1): fail closed on unvalidated starts and preserve validation under optimization'
+          git commit -m 'fix(v1): fail closed on unvalidated starts and keep checks under optimization'
           git push origin HEAD:refs/heads/plus
