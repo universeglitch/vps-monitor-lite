@@ -8,10 +8,10 @@ umask 077
 # Cloudflared is intentionally not installed or configured.
 #
 # 用法：
-#   bash install-dual.sh              正常安装
-#   bash install-dual.sh --check      只读检查当前部署状态（不修改系统）
-#   bash install-dual.sh --recover    在新 Shell 中恢复中断/失败的安装事务
-#   bash install-dual.sh --help       查看帮助
+#   bash install.sh              正常安装
+#   bash install.sh --check      只读检查当前部署状态（不修改系统）
+#   bash install.sh --recover    在新 Shell 中恢复中断/失败的安装事务
+#   bash install.sh --help       查看帮助
 # =========================================================
 
 PANEL_URL="https://raw.githubusercontent.com/universeglitch/vps-monitor-lite/main/panel_dual.py"
@@ -79,13 +79,13 @@ port_in_use(){
 
 usage(){
   cat <<'EOF'
-install-dual.sh —— Xray 双节点 + Node Monitor 安装脚本
+install.sh —— Xray 双节点 + Node Monitor 安装脚本
 
 用法：
-  bash install-dual.sh              正常安装（交互式）
-  bash install-dual.sh --check      只读检查当前部署状态，不修改系统
-  bash install-dual.sh --recover    在新 Shell 中恢复中断/失败的安装事务
-  bash install-dual.sh --help       显示本帮助
+  bash install.sh              正常安装（交互式）
+  bash install.sh --check      只读检查当前部署状态，不修改系统
+  bash install.sh --recover    在新 Shell 中恢复中断/失败的安装事务
+  bash install.sh --help       显示本帮助
 
 说明：
   --check   仅检查系统版本架构、Xray、面板、服务、认证文件和未完成事务，
@@ -827,6 +827,15 @@ restore_one_file(){
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
   fi
+  # 普通文件的数据先落盘，再发布目录项；符号链接不得跟随其目标同步。
+  if [[ -f "$tmp" && ! -L "$tmp" ]]; then
+    if ! fsync_path "$tmp"; then
+      red "恢复失败：无法持久化临时文件数据：$tmp"
+      rm -f -- "$tmp" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
   # 原子替换（-T 保证目标是文件/符号链接时不会误判为目录移动）
   if ! mv -fT -- "$tmp" "$src" 2>/dev/null; then
     if [[ ! -d "$src" ]] && ! mv -f -- "$tmp" "$src"; then
@@ -1144,7 +1153,8 @@ restore_transaction(){
   # 清理本次创建的 Xray 用户（仅当安装前不存在）
   if [[ "$xu_existed" == "0" ]] && getent passwd xray >/dev/null 2>&1; then
     local xray_pids=""
-    if ! xray_pids="$(ps -u xray -o pid= 2>/dev/null)"; then
+    if ! xray_pids="$(ps -e -o user:256= -o pid= 2>/dev/null |
+      awk '$1 == "xray" { print $2 }')"; then
       red "恢复失败：无法检查 Xray 用户进程，不能安全删除账户，相关服务保持停止。"
       return 1
     fi
@@ -1293,8 +1303,8 @@ on_exit(){
     if ! rollback_all; then
       red "严重警告：安装失败，而且自动回滚未能完全完成！"
       red "请勿直接重新运行安装脚本。"
-      red "请先执行：bash install-dual.sh --check"
-      red "再执行：  bash install-dual.sh --recover"
+      red "请先执行：bash install.sh --check"
+      red "再执行：  bash install.sh --recover"
     fi
   fi
   exit "$rc"
@@ -1422,7 +1432,7 @@ detect_existing(){
   if (( complete )); then
     red "诊断结论：完整安装（A）。"
     red "系统已存在完整的 Xray + 面板部署，禁止重复安装，以免覆盖节点、密钥或账号。"
-    red "如需检查或恢复，请使用：bash install-dual.sh --check / --recover"
+    red "如需检查或恢复，请使用：bash install.sh --check / --recover"
   elif (( ${#found[@]} == 1 )) && (( xray_conf == 0 )) && (( panel_conf == 0 )) &&
        (( panel_py == 0 )) && (( auth_f == 0 )) && (( secret_f == 0 )); then
     red "诊断结论：残留文件（C）。"
@@ -1431,8 +1441,8 @@ detect_existing(){
   elif (( xray_conf || panel_conf || panel_py )); then
     red "诊断结论：部分安装（B）。"
     red "存在部分安装文件，可能是上一次安装中断。请勿直接重装。"
-    red "请先执行：bash install-dual.sh --check"
-    red "再执行：  bash install-dual.sh --recover"
+    red "请先执行：bash install.sh --check"
+    red "再执行：  bash install.sh --recover"
   else
     red "诊断结论：未知部署（D）。"
     red "检测到无法明确归类的部署痕迹（例如存在 Xray 用户/服务但缺少匹配配置）。"
@@ -1611,7 +1621,7 @@ check_mode(){
     echo "  存在回滚失败的事务。请保留备份目录，执行 --recover 查看，必要时人工恢复。"
   elif (( unfinished > 0 )); then
     red "安装中断，存在未完成或异常的安装事务。"
-    echo "  请先执行：bash install-dual.sh --recover"
+    echo "  请先执行：bash install.sh --recover"
     echo "  恢复完成前不要重新安装，也不要删除残留文件。"
     echo "  若事务缺少状态文件（异常事务目录），--recover 会拒绝自动恢复，需人工核对。"
   elif (( complete )); then
@@ -1626,7 +1636,7 @@ check_mode(){
   elif (( artifacts )); then
     red "检测到不完整或不一致的部署状态。"
     echo "  存在部分安装痕迹但未构成完整部署，请勿直接重装。"
-    echo "  建议先执行：bash install-dual.sh --recover（若有未完成事务），否则人工核对。"
+    echo "  建议先执行：bash install.sh --recover（若有未完成事务），否则人工核对。"
   else
     green "未安装，可进行全新安装。"
   fi
@@ -1938,8 +1948,8 @@ if [[ -n "$UNFINISHED" ]]; then
     red "  - $d  状态=$status  阶段=$stage"
   done
   red "为避免叠加损坏，安装已停止。"
-  red "请先执行：bash install-dual.sh --check"
-  red "再执行：  bash install-dual.sh --recover"
+  red "请先执行：bash install.sh --check"
+  red "再执行：  bash install.sh --recover"
   red "确认恢复完成后再重新安装。"
   exit 1
 fi
@@ -2261,16 +2271,20 @@ set_stage "4/8 生成 Xray 配置"
 green "[4/8] 生成 Xray 配置"
 
 python3 - "$XRAY_CONFIG" "$REALITY_ENABLED" "$WS_PORT" "$WS_PATH" "$WS_UUID" \
-  "$REALITY_PORT" "$REALITY_UUID" "$REALITY_PRIVATE_KEY" \
-  "$REALITY_SNI" "$REALITY_TARGET" "$REALITY_SHORT_ID" <<'PY'
-import json, sys
+  "$REALITY_PORT" "$REALITY_UUID" \
+  "$REALITY_SNI" "$REALITY_TARGET" "$REALITY_SHORT_ID" 3<<<"$REALITY_PRIVATE_KEY" <<'PY'
+import json, os, sys
 from pathlib import Path
 
 (
     output, reality_enabled, ws_port, ws_path, ws_uuid,
-    reality_port, reality_uuid, private_key,
+    reality_port, reality_uuid,
     sni, target, short_id
 ) = sys.argv[1:]
+
+# 专用 FD 传递私钥，不放入进程参数或环境变量。
+with os.fdopen(3, "r") as key_input:
+    private_key = key_input.read().rstrip("\n")
 
 inbounds = [
     {

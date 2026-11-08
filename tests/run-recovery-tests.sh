@@ -993,6 +993,8 @@ test_special_file_rejected(){
 # T33–T43 复用本文件断言、合法事务夹具与提取出的 install.sh 函数库。
 # shellcheck disable=SC1091
 source "$ROOT/tests/recovery-boundary-tests.sh" || exit 2
+# shellcheck disable=SC1091
+source "$ROOT/tests/install-safety-regression-tests.sh" || exit 2
 
 # 每个用例放在独立子 Shell，防止 cp/restore_one_file/state_write 等 mock 泄漏。
 # 意外退出也计入失败，不会因为缺少结果文件而误报通过。
@@ -1057,6 +1059,11 @@ run_test test_boundary_state_corrupt
 run_test test_boundary_tsv_corrupt
 run_test test_boundary_partial_service_failure
 run_test test_boundary_journal_and_post
+run_test test_safety_process_snapshot
+run_test test_safety_file_sync_order
+run_test test_safety_symlink_sync
+run_test test_safety_private_key_fd
+run_test test_safety_help_and_sources
 echo "--------------------------------------------------"
 printf '结果：\033[32m%d 通过\033[0m，\033[31m%d 失败\033[0m\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
