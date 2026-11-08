@@ -174,3 +174,18 @@ class RotationTests(AuthTests):
         self.a.restore_local(token, 'previous')
         token = self.login()
         self.assertEqual(self.a.read_api(token, api['id']), api['key'])
+
+class DisasterRestoreTests(unittest.TestCase):
+    def test_new_machine_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a=Auth(os.path.join(tmp,'old'),gate=lambda k:contextlib.nullcontext())
+            b=Auth(os.path.join(tmp,'new'),gate=lambda k:contextlib.nullcontext())
+            try:
+                a.initialize(P,P,local_authority=True);t=a.login(P,source='test')
+                api=a.create_api(t,'portable');package=a.export_backup(t,B)
+                b.import_fresh(package,B,local_authority=True)
+                token=b.login(P,source='test')
+                self.assertEqual(b.read_api(token,api['id']),api['key'])
+                with self.assertRaises(AuthError):b.validate(t)
+                with self.assertRaises(AuthError):b.import_fresh(package,B,local_authority=True)
+            finally:a.close();b.close()

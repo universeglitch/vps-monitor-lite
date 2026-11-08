@@ -761,3 +761,33 @@ class Auth:
                                 os.unlink(name, dir_fd=fd); removed += 1
                         os.fsync(fd)
                 return removed
+
+    def import_fresh(self, raw, independent_password, *, local_authority=False):
+        """Offline/terminal disaster restore when the original VPS is unavailable.
+
+        Rejects ALL initialization traces. Does not import active Sessions. A failed
+        precommit restore leaves traces for explicit recovery, never auto-reset.
+        """
+        if local_authority is not True:
+            raise AuthError('trusted terminal restore required')
+        password(independent_password)
+        with self.cost('restore'):
+            envelope = loads(raw, MAX_ENVELOPE); h = envelope['header']
+            if set(h) != {'format','kdf','m','t','p','salt'} or (h['format'],h['kdf'],h['m'],h['t'],h['p']) != (1,'argon2id-v19',8192,3,1):
+                raise Corrupt('unsupported backup KDF')
+            if not HASH_GATE.acquire(timeout=2): raise Busy('Argon2 worker busy')
+            try:
+                key=hash_secret_raw(independent_password.encode(),unb64(h['salt'],16),3,8192,1,32,Type.ID,19)
+            finally: HASH_GATE.release()
+            payload=loads(open_seal(key,envelope['sealed'],dumps(h)));self.check_payload(payload)
+            with self.store.transaction():
+                if self.store.read('auth.json',missing=True) is not None or self.store.read('master.key','master',True) is not None:
+                    raise AuthError('fresh restore refuses existing or partial vault')
+                s=payload['state'];s.pop('master_object',None)
+                self.store.write('master.key',unb64(payload['master'],32),'master')
+                self.store.write('sessions.json',dumps({}))
+                for objid,obj in payload['objects'].items():
+                    if not IDENT.fullmatch(objid):raise Corrupt('invalid imported object ID')
+                    self.store.write('API_'+objid+'.json',dumps(obj),'api')
+                s['epoch']+=1
+                self.commit(s)

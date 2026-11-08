@@ -128,8 +128,9 @@ class ResourceGate:
 
 
 class Coordinator:
-    def __init__(self, auth: Auth, active, gate: ResourceGate):
+    def __init__(self, auth: Auth, active, gate: ResourceGate, xray=None, discovery=None, installer=None):
         self.auth, self.active, self.gate = auth, active, gate
+        self.xray, self.discovery, self.installer = xray, discovery, installer
 
     def status(self, token):
         self.auth.validate(token)
@@ -153,15 +154,25 @@ class Coordinator:
 
     def configure_xray(self, token, request):
         self.auth.validate(token)
-        # No guessed protocol or restart permission; explicit refusal until the
-        # durable single-writer transaction implementation is reviewed.
-        raise AuthError('Xray configuration writer not enabled: protocol parameters and durable recovery validation required')
+        if self.xray is None: raise AuthError('Xray transaction backend not configured')
+        if not isinstance(request,dict): raise AuthError('configuration request required')
+        return self.xray.configure(token,request.get('confirmation'),request.get('inbounds'))
 
-    def install(self, token, service, confirmed=False):
+    def confirm_xray(self, token):
         self.auth.validate(token)
-        if confirmed is not True:
-            raise AuthError('explicit installation confirmation required')
-        raise AuthError('installation refused: no measured installer resource profile or approved recipe')
+        if self.xray is None: raise AuthError('Xray transaction backend not configured')
+        return self.xray.confirm(token)
+
+    def discover(self, token, service):
+        self.auth.validate(token)
+        if self.discovery is None: raise AuthError('discovery unavailable')
+        return self.discovery.inspect(service)
+
+    def install(self, token, service, confirmation=None):
+        epoch=self.auth.validate(token)
+        if self.installer is None: raise AuthError('approved installer recipes unavailable')
+        if confirmation is None:return self.installer.prepare(service,epoch)
+        return self.installer.execute(service,epoch,confirmation)
 
 
 class XrayTransaction:
@@ -359,3 +370,129 @@ class XrayTransaction:
                 return {'stage':r['stage'],'requires_confirmation':True}
             self._rollback(r)
             return {'stage':r['stage']}
+
+
+class Discovery:
+    """Read-only local discovery; absent program != missing config.
+
+    No guesses for Cloudflared credentials/command line. Explicit config paths
+    are deployment inputs. No legacy panel import and no port auto-allocation.
+    """
+    def __init__(self, active, xray_config=Path('/usr/local/etc/xray/config.json'), cloud_config=None):
+        self.active=active;self.xray_config=Path(xray_config)
+        self.cloud_config=Path(cloud_config) if cloud_config else None
+
+    def inspect(self, name):
+        import shutil
+        from auth import loads
+        if name not in ('xray','cloudflared'):raise AuthError('unsupported service')
+        program=shutil.which(name)
+        unit=self.active.inspect(name)
+        path=self.xray_config if name=='xray' else self.cloud_config
+        missing=[]
+        if not program:missing.append('program')
+        if not unit['installed']:missing.append('systemd unit')
+        if missing:return dict(unit,readiness='not_installed',missing=missing)
+        if path is None or not path.is_file() or path.is_symlink():
+            return dict(unit,readiness='not_configured',missing=['verified config path'])
+        if name=='xray':
+            if path.stat().st_size>262144:raise AuthError('configuration size limit')
+            try:
+                data=loads(path.read_bytes())
+                if not isinstance(data,dict) or not isinstance(data.get('inbounds'),list):raise ValueError()
+            except (ValueError,AuthError):return dict(unit,readiness='config_error',missing=[])
+        # JSON syntax/file existence alone never substitutes for executable test.
+        return dict(unit,readiness='requires_validation',config=str(path),program=program,missing=[])
+
+
+class BoundedCommand:
+    """Trusted argv only; bounded stdout/stderr, timeout and pressure checkpoints.
+
+    A task requiring cgroup isolation is refused unless a measured task launcher
+    is explicitly injected. Never accepts shell strings from HTTP.
+    """
+    def __init__(self, gate, launcher=None):
+        self.gate,self.launcher=gate,launcher
+
+    def run(self, argv, timeout=30, isolated=True):
+        import subprocess,selectors
+        if not isinstance(argv,(list,tuple)) or not argv or any(not isinstance(a,str) for a in argv):
+            raise AuthError('trusted argv required')
+        if isolated:
+            if self.launcher is None:raise Busy('measured transient task cgroup is not configured')
+            argv=self.launcher(tuple(argv))
+        self.gate.checkpoint()
+        p=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                           env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'},start_new_session=True)
+        sel=selectors.DefaultSelector();output=bytearray();deadline=time.monotonic()+timeout
+        for stream in (p.stdout,p.stderr):sel.register(stream,selectors.EVENT_READ)
+        try:
+            while sel.get_map():
+                if time.monotonic()>deadline:raise Busy('task timeout')
+                self.gate.checkpoint()
+                for key,_ in sel.select(.25):
+                    raw=os.read(key.fileobj.fileno(),4096)
+                    if not raw:sel.unregister(key.fileobj);continue
+                    output.extend(raw)
+                    if len(output)>65536:raise Busy('task output limit')
+            returncode=p.wait(timeout=max(.01,deadline-time.monotonic()))
+            if returncode:raise AuthError('task failed; inspect protected operation log')
+            return bytes(output)
+        finally:
+            if p.poll() is None:
+                import signal
+                os.killpg(p.pid,signal.SIGKILL)
+            p.wait();sel.close();p.stdout.close();p.stderr.close()
+
+
+class XraySelfTest:
+    def __init__(self, runner, executable):
+        self.runner,self.executable=runner,executable
+    def __call__(self, raw):
+        import tempfile
+        if not Path(self.executable).is_file():raise AuthError('Xray executable missing')
+        fd,path=tempfile.mkstemp(prefix='vps-xray-test-',suffix='.json')
+        try:
+            os.fchmod(fd,0o600)
+            with os.fdopen(fd,'wb',closefd=False) as f:f.write(raw);f.flush();os.fsync(fd)
+            self.runner.run([self.executable,'run','-test','-config',path],timeout=30)
+        finally:
+            os.close(fd);os.unlink(path)
+
+
+class ConfirmedInstaller:
+    """Admin-provisioned fixed recipes, digest checked; no guessed installers.
+
+    This runner is for bounded tasks safe to terminate. General package managers
+    are refused: cancelling them under pressure can leave the OS inconsistent.
+    """
+    def __init__(self, gate, runner, discovery, recipes=None):
+        self.gate,self.runner,self.discovery=gate,runner,discovery
+        self.recipes=recipes or {};self.permits={};self.lock=threading.Lock()
+    def prepare(self, name, epoch):
+        import secrets
+        info=self.discovery.inspect(name)
+        if info['readiness']!='not_installed':return {'installation_needed':False,'discovery':info}
+        with self.lock:
+            now=time.monotonic();self.permits={k:v for k,v in self.permits.items() if v[2]>now}
+            if len(self.permits)>=8:raise Busy('confirmation queue full')
+            token=secrets.token_hex(32);self.permits[token]=(name,epoch,now+120)
+        return {'installation_needed':True,'missing':info['missing'],'confirmation':token}
+    def execute(self, name, epoch, confirmation):
+        with self.lock:permit=self.permits.pop(confirmation,None)
+        if not permit or permit[0]!=name or permit[1]!=epoch or permit[2]<=time.monotonic():
+            raise AuthError('installation confirmation expired or mismatched')
+        recipe=self.recipes.get(name)
+        if not recipe or recipe.get('safe_to_terminate') is not True:
+            raise AuthError('bounded installation recipe unavailable; no automatic package-manager invocation')
+        import hashlib,stat
+        path=Path(recipe['path']);st=path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_mode&0o022 or st.st_size>262144:
+            raise AuthError('unsafe installer recipe')
+        if hashlib.sha256(path.read_bytes()).hexdigest()!=recipe['sha256']:
+            raise AuthError('installer recipe digest mismatch')
+        with self.gate('install-'+name):
+            self.runner.run([str(path)],timeout=recipe.get('timeout',120))
+            after=self.discovery.inspect(name)
+            if after['readiness']=='not_installed':raise AuthError('post-install verification failed')
+            return after

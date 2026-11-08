@@ -190,6 +190,7 @@ def cli():
     p=argparse.ArgumentParser(description='V1 plus management; legacy panel remains frozen')
     p.add_argument('--data',required=True)
     p.add_argument('--resource-profile',required=True,help='private JSON of measured incremental profiles and reserve bytes')
+    p.add_argument('--restore-fresh',help='encrypted external backup; trusted terminal, empty vault only')
     p.add_argument('--initialize',action='store_true',help='trusted terminal bootstrap; do not expose through HTTP')
     p.add_argument('--bind',default='127.0.0.1')
     p.add_argument('--port',type=int,required=True)
@@ -207,6 +208,13 @@ def cli():
     gate=ResourceGate(Memory(),profile['profiles'],profile['reserve'])
     auth=Auth(args.data,gate=gate); active=Active()
     try:
+        if args.restore_fresh:
+            if args.initialize or not os.isatty(0): p.error('fresh restore requires trusted terminal and exclusive mode')
+            with open(args.restore_fresh,'rb') as backup:
+                package=backup.read(1048577)
+            auth.import_fresh(package,getpass.getpass('独立备份密码：'),local_authority=True)
+            print('认证备份已恢复，所有旧 Session 无效')
+            return
         if args.initialize:
             if not os.isatty(0): p.error('interactive trusted terminal required')
             recovery=auth.initialize(getpass.getpass('管理密码：'),getpass.getpass('确认密码：'),local_authority=True)
