@@ -340,7 +340,7 @@ class XrayTransaction:
         old=unb64(r['old'])
         if self.fingerprint(old)!=r['old_hash']: raise AuthError('backup fingerprint mismatch')
         if current!=r['old_hash']: self._replace(old,r['meta'],r['new_hash'])
-        self.service.apply_xray(r['was_active'])
+        self.service.apply_xray(r['was_active'], rollback=True)
         r['stage']='ROLLED_BACK'; self._record(r)
 
     def recover(self, token, restart_confirmed=False):

@@ -168,10 +168,11 @@ class Active:
         if self.thread is not None:
             self.thread.join(timeout=12)
 
-    def apply_xray(self, was_active):
+    def apply_xray(self, was_active, rollback=False):
         """Only Coordinator's confirmed transaction may call this operation."""
         with self.lock:
-            operation = 'restart' if was_active else 'start'
+            operation = 'stop' if rollback and not was_active else ('restart' if was_active else 'start')
             rc, _ = self.run(operation, UNITS['xray'])
-            if rc or not self.inspect('xray')['active']:
+            expected = not (rollback and not was_active)
+            if rc or self.inspect('xray')['active'] != expected:
                 raise ServiceError('Xray configuration application failed')

@@ -14,7 +14,7 @@ class Gate:
 class Service:
     def __init__(self): self.calls=[]; self.fail=False
     def inspect(self,name): return {'installed':True,'active':True}
-    def apply_xray(self,was_active):
+    def apply_xray(self,was_active,rollback=False):
         self.calls.append(was_active)
         if self.fail:
             self.fail=False

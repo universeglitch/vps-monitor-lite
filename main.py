@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlsplit
 
 from active import Active, ServiceError
-from auth import Auth, AuthError, BackupPending, Busy, Corrupt, loads
+from auth import Auth, AuthError, BackupPending, Busy, Corrupt, loads, b64, unb64
 from function import Coordinator, Memory, ResourceGate
 
 PAGE = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VPS Monitor</title>
@@ -31,8 +31,18 @@ PAGE = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="vi
 <dialog id="modal"><h2 id="title"></h2><div id="body"></div><button id="close">确认关闭</button></dialog></main><script>
 'use strict';let csrf='';const $=s=>document.getElementById(s);function notice(t){$('notice').textContent=t}async function request(path,data){let r=await fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json','X-CSRF-Token':csrf}:{},body:data?JSON.stringify(data):undefined,cache:'no-store'});let j=await r.json();if(!r.ok)throw Error(j.error||'操作失败');return j}function button(t,fn){let b=document.createElement('button');b.textContent=t;b.onclick=async()=>{try{await fn()}catch(e){notice(e.message)}};return b}function show(title){$('title').textContent=title;$('body').replaceChildren();$('modal').showModal();return $('body')}async function refresh(){let s=await request('/session');csrf=s.csrf;$('login').hidden=true;$('app').hidden=false;let st=await request('/status');$('services').replaceChildren();for(let [label,id] of [['WS + TLS','ws'],['XHTTP','xhttp'],['WS + Reality','reality'],['Cloudflared','cloudflared'],['详细面板','panel'],['测活','heartbeat']]){let row=document.createElement('div');row.className='row';let text=document.createElement('span');text.textContent=label;let b=button('',async()=>{if(id==='heartbeat'){await request('/heartbeat',{enabled:!st.heartbeat});await refresh()}else{notice('本项尚未完成安全配置/确认流程，当前拒绝操作，不会自动安装或重启')}});let on=id==='heartbeat'?st.heartbeat:id==='cloudflared'&&st.services.cloudflared.active;b.className='switch'+(on?' on':'');b.setAttribute('aria-label',label);b.setAttribute('aria-pressed',String(!!on));if(id!=='heartbeat')b.disabled=true;row.append(text,b);$('services').append(row)}}
 $('loginButton').onclick=async()=>{try{await request('/login',{password:$('password').value});$('password').value='';await refresh();notice('')}catch(e){$('password').value='';notice(e.message)}};$('logout').onclick=async()=>{try{await request('/logout',{});location.reload()}catch(e){notice(e.message)}};$('close').onclick=()=>{$('body').replaceChildren();$('modal').close()};
-$('api').onclick=()=>{let body=show('API 管理');body.append(button('生成 API Key',async()=>{let name=prompt('API 名称');if(name===null)return;let j=await request('/api/create',{name});let box=show('API Key');let p=document.createElement('p');p.className='secret';p.textContent=j.key;box.append(p,button('复制',async()=>navigator.clipboard.writeText(j.key)))}),button('读取 API Key',async()=>{let j=await request('/api/list');let box=show('选择 API');for(let r of j.items){let row=document.createElement('div');row.className='row';row.append(button(r.name,async()=>{let k=await request('/api/read',{ident:r.id});let b=show(r.name);let p=document.createElement('p');p.className='secret';p.textContent=k.key;b.append(p,button('复制',async()=>navigator.clipboard.writeText(k.key)))}),button('删除',async()=>{if(!confirm('确认删除 API：'+r.name+'？'))return;await request('/api/delete',{ident:r.id,confirmation_name:r.name});row.remove()}));box.append(row)}}))};
-$('manage').onclick=()=>{let box=show('管理功能');box.append(button('修改管理密码',async()=>{let old=prompt('当前管理密码');if(old===null)return;let value=prompt('新管理密码');if(value===null)return;let confirmation=prompt('再次输入新管理密码');if(confirmation===null)return;await request('/password',{old,new:value,confirmation});location.reload()}));notice('备份导出、恢复及密钥轮换的网页流程尚未接入；不会执行占位操作')};refresh().catch(()=>{});
+$('api').onclick=()=>{let body=show('API 管理');body.append(button('生成 API Key',async()=>{return fields('生成 API Key',[['name','API 名称','text']],async data=>{let j=await request('/api/create',data);let box=show('API Key');let p=document.createElement('p');p.className='secret';p.textContent=j.key;box.append(p,button('复制',async()=>navigator.clipboard.writeText(j.key)))});} ),button('读取 API Key',async()=>{let j=await request('/api/list');let box=show('选择 API');for(let r of j.items){let row=document.createElement('div');row.className='row';row.append(button(r.name,async()=>{let k=await request('/api/read',{ident:r.id});let b=show(r.name);let p=document.createElement('p');p.className='secret';p.textContent=k.key;b.append(p,button('复制',async()=>navigator.clipboard.writeText(k.key)))}),button('删除',async()=>{if(!confirm('确认删除 API：'+r.name+'？'))return;await request('/api/delete',{ident:r.id,confirmation_name:r.name});row.remove()}));box.append(row)}}))};
+async function fields(title, items, perform){let box=show(title);let inputs={};for(let item of items){let label=document.createElement('label');label.textContent=item[1];let input=document.createElement('input');input.type=item[2]||'password';input.autocomplete='off';inputs[item[0]]=input;label.append(input);box.append(label)}box.append(button('确认执行',async()=>{let data={};for(let [k,v] of Object.entries(inputs)){data[k]=v.value;v.value=''}await perform(data)}))}
+$('manage').onclick=()=>{let box=show('管理功能');box.append(
+button('修改管理密码',()=>fields('修改管理密码',[['old','当前密码'],['new','新密码'],['confirmation','确认新密码']],async d=>{await request('/password',d);location.reload()})),
+button('本地加密备份',async()=>{await request('/backup/local',{});notice('本地备份完成')}),
+button('导出外部加密备份',()=>fields('独立备份密码',[['password','独立备份密码']],async d=>{let r=await request('/backup/export',d);let bytes=Uint8Array.from(atob(r.package),c=>c.charCodeAt(0));let url=URL.createObjectURL(new Blob([bytes],{type:'application/octet-stream'}));let a=document.createElement('a');a.href=url;a.download='vps-auth-backup.enc';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);$('modal').close();notice('导出完成，请异地保存并保管独立密码')})),
+button('恢复外部备份',async()=>{let b=show('恢复外部备份（使所有旧 Session 失效）');let f=document.createElement('input');f.type='file';let pass=document.createElement('input');pass.type='password';pass.placeholder='独立备份密码';b.append(f,pass,button('确认恢复',async()=>{if(!f.files[0]||f.files[0].size>1048576)throw Error('请选择不超过 1 MiB 的加密备份');if(!confirm('确认验证并恢复认证数据？所有 Session 将失效。'))return;let raw=new Uint8Array(await f.files[0].arrayBuffer());let text='';for(let i=0;i<raw.length;i+=4096)text+=String.fromCharCode(...raw.subarray(i,i+4096));let p=pass.value;pass.value='';await request('/backup/restore',{package:btoa(text),password:p});location.reload()}))}),
+button('恢复本地备份',async()=>{let b=show('选择本地备份');for(let slot of ['latest','previous'])b.append(button(slot,async()=>{if(!confirm('确认恢复 '+slot+'？所有 Session 将失效。'))return;await request('/backup/local-restore',{slot});location.reload()}))}),
+button('轮换主密钥',async()=>{if(!confirm('确认轮换 LMK/KEK/DEK，并触发加密备份？'))return;let r=await request('/keys/rotate',{});notice('密钥已轮换，版本 '+r.version)}),
+button('清理无引用对象',async()=>{if(!confirm('仅清理不被当前状态和本地备份引用的对象？'))return;let r=await request('/keys/cleanup',{});notice('已清理对象 '+r.removed)}))};
+$('login').append(button('忘记密码',()=>fields('恢复密码',[['recovery','恢复密钥'],['new','新管理密码'],['confirmation','确认密码']],async d=>{let r=await request('/recover',d);let b=show('新恢复密钥（仅本次展示）');let p=document.createElement('p');p.className='secret';p.textContent=r.recovery;b.append(p,button('复制',()=>navigator.clipboard.writeText(r.recovery)));notice('密码已恢复；旧恢复密钥和全部旧 Session 已失效')})));
+refresh().catch(()=>{});
 </script></html>'''
 
 
@@ -118,11 +128,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Transfer-Encoding') is not None:
                 raise AuthError('chunked requests not accepted')
             lengths=self.headers.get_all('Content-Length',[])
-            if len(lengths)!=1 or not lengths[0].isdigit() or not 0<int(lengths[0])<=8192:
+            if len(lengths)!=1 or not lengths[0].isdigit() or not 0<int(lengths[0])<=1_400_000:
                 raise AuthError('invalid request size')
             if self.headers.get_content_type() != 'application/json':
                 raise AuthError('JSON required')
-            data=loads(self.rfile.read(int(lengths[0])))
+            raw=self.rfile.read(int(lengths[0]))
+            if len(raw)!=int(lengths[0]): raise AuthError('incomplete request')
+            data=loads(raw,1_400_000)
             if not isinstance(data,dict): raise AuthError('object required')
             c=self.server.coordinator
             if self.path == '/login':
@@ -130,6 +142,9 @@ class Handler(BaseHTTPRequestHandler):
                 # unvalidated forwarding headers for rate limit identity.
                 token=c.auth.login(data.get('password'),source=self.client_address[0])
                 return self.reply(200,{'ok':True},'__Host-vps_session='+token+'; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400')
+            if self.path == '/recover':
+                replacement=c.auth.recover(data.get('recovery'),data.get('new'),data.get('confirmation'),source=self.client_address[0])
+                return self.reply(200,{'recovery':replacement})
             token=self.token(); c.auth.validate(token)
             if not hmac.compare_digest(self.headers.get('X-CSRF-Token',''),self.csrf(token)):
                 raise AuthError('CSRF rejected')
@@ -145,6 +160,19 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/password':
                 c.auth.change_password(token,data.get('old'),data.get('new'),data.get('confirmation'),source=self.client_address[0])
                 return self.reply(200,{'ok':True})
+            if self.path == '/backup/export':
+                return self.reply(200,{'package':b64(c.auth.export_backup(token,data.get('password')))})
+            if self.path == '/backup/restore':
+                c.auth.restore_backup(token,unb64(data.get('package')),data.get('password'))
+                return self.reply(200,{'ok':True,'sessions_revoked':True})
+            if self.path == '/backup/local':
+                return self.reply(200,{'revision':c.auth.local_backup(token)})
+            if self.path == '/backup/local-restore':
+                c.auth.restore_local(token,data.get('slot'));return self.reply(200,{'ok':True,'sessions_revoked':True})
+            if self.path == '/keys/rotate':
+                return self.reply(200,{'version':c.auth.rotate_keys(token)})
+            if self.path == '/keys/cleanup':
+                return self.reply(200,{'removed':c.auth.collect_objects(token)})
             if self.path == '/heartbeat':
                 c.active.set_heartbeat(data.get('enabled')); return self.reply(200,{'ok':True})
             raise AuthError('operation unavailable')
@@ -172,6 +200,10 @@ def cli():
     if origin.scheme!='https' or not origin.netloc or origin.path or origin.query or origin.fragment or origin.username:
         p.error('exact HTTPS origin required')
     with open(args.resource_profile,'rb') as f: profile=loads(f.read(262145))
+    if (not isinstance(profile,dict) or not isinstance(profile.get('profiles'),dict) or
+        type(profile.get('reserve')) is not int or not 0 < profile['reserve'] < 200_000_000 or
+        any(type(v) is not int or not 0 < v < 200_000_000 for v in profile['profiles'].values())):
+        p.error('positive measured byte profiles and reserve required')
     gate=ResourceGate(Memory(),profile['profiles'],profile['reserve'])
     auth=Auth(args.data,gate=gate); active=Active()
     try:
