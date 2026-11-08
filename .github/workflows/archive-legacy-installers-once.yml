@@ -1,0 +1,96 @@
+name: Archive legacy installers once
+on:
+  push:
+    branches: [trae/agent-gteadp-install-safety]
+    paths: [.github/workflows/archive-legacy-installers-once.yml]
+permissions:
+  contents: write
+concurrency:
+  group: archive-legacy-installers-once
+  cancel-in-progress: false
+jobs:
+  archive:
+    if: github.ref == 'refs/heads/trae/agent-gteadp-install-safety'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out triggering commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+      - name: Verify, archive, document and remove this one-time workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=69a88ea53cbcceba48a0424408507e8ab413ff85
+          workflow=.github/workflows/archive-legacy-installers-once.yml
+          test "$(git rev-parse HEAD^)" = "$base"
+          test "$(git diff --name-only "$base" HEAD)" = "$workflow"
+          test "$(git rev-parse HEAD:install-dual.sh)" = 81bbe73b7803b77281a35e9d5679ae0676edbc0d
+          test "$(git rev-parse HEAD:install-dual.bak)" = 36c1cc4e34413a46008ca4a1918147cd37bde4aa
+          mkdir -p old_version
+          for src in install-dual.sh install-dual.bak; do
+            blob=$(git rev-parse "HEAD:$src")
+            dst="old_version/install-dual-${blob}.${src##*.}"
+            test ! -e "$dst"
+            git mv -- "$src" "$dst"
+            test "$(git hash-object "$dst")" = "$blob"
+            printf 'Verified unchanged blob: %s -> %s\n' "$src" "$dst"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('README.md')
+          s = p.read_text()
+          s = s.replace('install-dual.sh', 'install.sh')
+          old = '本节验收对象为 `install.sh`；上文保留的 `install.sh` 使用说明不构成对该文件完成同一轮验收的声明。'
+          assert s.count(old) == 1
+          s = s.replace(old, '本节验收对象为下述固定 commit 中的 `install.sh`；归档操作不修改该脚本或测试代码，也不扩大原验收范围。')
+          intro = '''## 当前入口与历史版本
+
+          根目录保留当前安装入口 `install.sh`、更新脚本 `update.sh` 和面板源码 `panel_dual.py`（文件名使用下划线）。本次整理不改变这些文件的内容。
+
+          两份旧安装脚本按完整 Git Blob SHA 归档，内容保持不变，仅供历史查阅，不作为当前安装入口：
+
+          | 原路径 | 归档路径（文件名包含完整 Git Blob SHA） |
+          | --- | --- |
+          | `install-dual.sh` | [`old_version/install-dual-81bbe73b7803b77281a35e9d5679ae0676edbc0d.sh`](old_version/install-dual-81bbe73b7803b77281a35e9d5679ae0676edbc0d.sh) |
+          | `install-dual.bak` | [`old_version/install-dual-36c1cc4e34413a46008ca4a1918147cd37bde4aa.bak`](old_version/install-dual-36c1cc4e34413a46008ca4a1918147cd37bde4aa.bak) |
+
+          上述哈希是 Git Blob SHA，不是文件 SHA256；现有历史备份没有被覆盖。测试仍优先使用 `install.sh`，其旧文件回退逻辑未修改。`install.sh` 内少量历史提示仍包含 `install-dual.sh`，本次不改程序逻辑；实际运行请使用下面的 `install.sh` 命令。
+
+          '''
+          anchor = '安装脚本 install.sh 支持三种运行模式：'
+          assert s.count(anchor) == 1
+          p.write_text(s.replace(anchor, intro + anchor))
+          PY
+          git rm -- "$workflow"
+          git add -- README.md
+          git diff --cached --check
+          for f in install.sh update.sh panel_dual.py tests/run-recovery-tests.sh tests/recovery-boundary-tests.sh; do
+            test "$(git hash-object "$f")" = "$(git rev-parse "$base:$f")"
+            printf 'Unchanged: %s\n' "$f"
+          done
+          python3 - <<'PY'
+          import subprocess
+          base = '69a88ea53cbcceba48a0424408507e8ab413ff85'
+          entries = subprocess.check_output(['git', 'ls-files', '-s'], text=True).splitlines()
+          current = {line.split('\t', 1)[1]: line.split('\t', 1)[0].split()[:2] for line in entries}
+          old = subprocess.check_output(['git', 'ls-tree', '-r', base], text=True).splitlines()
+          expected = {}
+          for line in old:
+              meta, path = line.split('\t', 1)
+              mode, typ, blob = meta.split()
+              if path in ('install-dual.sh', 'install-dual.bak'):
+                  path = 'old_version/install-dual-' + blob + '.' + path.rsplit('.', 1)[1]
+              expected[path] = [mode, blob]
+          assert current.keys() == expected.keys(), 'Unexpected added/deleted path'
+          for path in expected:
+              if path != 'README.md':
+                  assert current[path] == expected[path], 'Unexpected content or mode change: ' + path
+          print('Entire tree verified: only README changes and two byte-identical moves')
+          PY
+          git diff --cached --stat
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: archive legacy installers by blob hash and document current entrypoint'
+          git push origin HEAD:refs/heads/trae/agent-gteadp-install-safety
