@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 from active import Active, ServiceError
 from auth import Auth, AuthError, BackupPending, Busy, Corrupt, loads, b64, unb64
-from function import Coordinator, Memory, ResourceGate, PanelBackend, Discovery
+from function import Coordinator, Memory, ResourceGate, PanelBackend, Discovery, XrayTransaction, XraySelfTest, BoundedCommand
 
 PAGE = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VPS Monitor</title>
 <style>*{box-sizing:border-box}body{margin:0;color:#eef0ff;font:16px system-ui;background:linear-gradient(145deg,#0c1938,#26143d);min-height:100vh}body{opacity:1;transition:opacity .3s ease-in-out}body.switching{opacity:0}main{max-width:620px;margin:32px auto;padding:20px}header{padding:24px;border-radius:22px;background:linear-gradient(120deg,#2163aa,#6542b0)}section{background:#141a34cc;border:1px solid #ffffff12;border-radius:20px;padding:20px;margin-top:18px;backdrop-filter:blur(12px)}.row{display:flex;justify-content:space-between;align-items:center;padding:14px 0;gap:12px}.switch{width:54px;height:30px;border-radius:20px;background:#414466;position:relative;transition:background .3s ease-in-out}.switch:after{content:'';position:absolute;width:22px;height:22px;left:4px;top:4px;border-radius:50%;background:white;transition:transform .3s ease-in-out}.switch.on{background:#35ac73}.switch.on:after{transform:translateX(24px)}button{color:inherit;background:#413578;border:0;border-radius:12px;padding:12px;cursor:pointer}button:active{transform:scale(.98)}button:disabled{opacity:.5;cursor:not-allowed}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.all{display:flex;align-items:center;flex-direction:column;gap:10px;color:#6cb8ff}.all .switch{background:#814fc1}input,select{display:block;width:100%;padding:12px;margin:10px 0;border:1px solid #454969;border-radius:10px;background:#11172e;color:white}dialog{width:min(90vw,430px);background:#18213e;color:white;border:1px solid #58508a;border-radius:18px}dialog::backdrop{background:#0009}#notice{white-space:pre-wrap;font-size:14px;color:#f5cd8e}small{color:#aeb9d4}.secret{overflow-wrap:anywhere}</style>
@@ -30,7 +30,7 @@ PAGE = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="vi
 <div id="app" hidden><section><div class="all"><span>一键开关</span><button class="switch" id="all" disabled title="未配置协议和重启确认流程，拒绝执行"></button></div><div id="services"></div></section><section class="grid"><button id="api">API 管理</button><button id="manage">管理功能</button><button id="modules">模块管理</button><button id="defaultMain">设为默认面板</button><button id="detail">切换到详细面板</button></section><button id="logout">退出当前设备</button></div><div id="detailHost" hidden></div><p id="notice" role="status"></p>
 <dialog id="modal"><h2 id="title"></h2><div id="body"></div><button id="close">确认关闭</button></dialog></main><script>
 'use strict';let csrf='';const $=s=>document.getElementById(s);function notice(t){$('notice').textContent=t}async function request(path,data){let r=await fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json','X-CSRF-Token':csrf}:{},body:data?JSON.stringify(data):undefined,cache:'no-store'});let j=await r.json();if(!r.ok)throw Error(j.error||'操作失败');return j}function button(t,fn){let b=document.createElement('button');b.textContent=t;b.onclick=async()=>{try{await fn()}catch(e){notice(e.message)}};return b}function show(title){$('title').textContent=title;$('body').replaceChildren();$('modal').showModal();return $('body')}async function refresh(){let s=await request('/session');csrf=s.csrf;$('login').hidden=true;$('app').hidden=false;let st=await request('/modules',{});$('services').replaceChildren();for(let [label,id] of st.modules.filter(m=>m.visible).map(m=>[m.name,m.id]).concat([['测活','heartbeat']])){let row=document.createElement('div');row.className='row';let text=document.createElement('span');text.textContent=label;let b=button('',async()=>{if(id==='heartbeat'){await request('/heartbeat',{enabled:!st.heartbeat});await refresh()}else{await toggleService(st.modules.find(m=>m.id===id));await refresh()}});let on=id==='heartbeat'?st.heartbeat:!!st.modules.find(m=>m.id===id)?.active;b.className='switch'+(on?' on':'');b.setAttribute('aria-label',label);b.setAttribute('aria-pressed',String(!!on));row.append(text,b);$('services').append(row)}}
-$('loginButton').onclick=async()=>{try{await request('/login',{password:$('password').value});$('password').value='';await refresh();notice('')}catch(e){$('password').value='';notice(e.message)}};$('logout').onclick=async()=>{try{await request('/logout',{});location.reload()}catch(e){notice(e.message)}};$('close').onclick=()=>{$('body').replaceChildren();$('modal').close()};
+$('loginButton').onclick=async()=>{try{await request('/login',{password:$('password').value});$('password').value='';await refresh();let prefs=await request('/preferences',{});if(prefs.default_panel==='panel')await switchPanel('panel');notice('')}catch(e){$('password').value='';notice(e.message)}};$('logout').onclick=async()=>{try{await request('/logout',{});location.reload()}catch(e){notice(e.message)}};$('close').onclick=()=>{$('body').replaceChildren();$('modal').close()};
 $('api').onclick=()=>{let body=show('API 管理');body.append(button('生成 API Key',async()=>{return fields('生成 API Key',[['name','API 名称','text']],async data=>{let j=await request('/api/create',data);let box=show('API Key');let p=document.createElement('p');p.className='secret';p.textContent=j.key;box.append(p,button('复制',async()=>navigator.clipboard.writeText(j.key)))});} ),button('读取 API Key',async()=>{let j=await request('/api/list');let box=show('选择 API');for(let r of j.items){let row=document.createElement('div');row.className='row';row.append(button(r.name,async()=>{let k=await request('/api/read',{ident:r.id});let b=show(r.name);let p=document.createElement('p');p.className='secret';p.textContent=k.key;b.append(p,button('复制',async()=>navigator.clipboard.writeText(k.key)))}),button('删除',async()=>{if(!confirm('确认删除 API：'+r.name+'？'))return;await request('/api/delete',{ident:r.id,confirmation_name:r.name});row.remove()}));box.append(row)}}))};
 async function fields(title, items, perform){let box=show(title);let inputs={};for(let item of items){let label=document.createElement('label');label.textContent=item[1];let input=document.createElement('input');input.type=item[2]||'password';input.autocomplete='off';inputs[item[0]]=input;label.append(input);box.append(label)}box.append(button('确认执行',async()=>{let data={};for(let [k,v] of Object.entries(inputs)){data[k]=v.value;v.value=''}await perform(data)}))}
 $('manage').onclick=()=>{let box=show('管理功能');box.append(
@@ -43,7 +43,7 @@ button('轮换主密钥',async()=>{if(!confirm('确认轮换 LMK/KEK/DEK，并�
 button('清理无引用对象',async()=>{if(!confirm('仅清理不被当前状态和本地备份引用的对象？'))return;let r=await request('/keys/cleanup',{});notice('已清理对象 '+r.removed)}))};
 $('login').append(button('忘记密码',()=>fields('恢复密码',[['recovery','恢复密钥'],['new','新管理密码'],['confirmation','确认密码']],async d=>{let r=await request('/recover',d);let b=show('新恢复密钥（仅本次展示）');let p=document.createElement('p');p.className='secret';p.textContent=r.recovery;b.append(p,button('复制',()=>navigator.clipboard.writeText(r.recovery)));notice('密码已恢复；旧恢复密钥和全部旧 Session 已失效')})));
 let detailReady=false, diagnosed=false;
-async function switchPanel(name){if(!['main','panel'].includes(name))return;document.body.classList.add('switching');await new Promise(r=>setTimeout(r,300));if(name==='panel'&&!detailReady){let d=await request('/view',{view:'panel'});let host=$('detailHost');let shadow=host.attachShadow({mode:'closed'});let style=document.createElement('style');style.textContent=d.style;let content=document.createElement('div');content.innerHTML=d.markup;shadow.append(style,content);let bridge={call:request,detail:async action=>({json:async()=>request('/detail',{action})}),expired:()=>location.reload(),switch:switchPanel,modules:moduleWindow,all:allServices,toggle:toggleService,port:portWindow,logout:()=>request('/logout',{}).then(()=>location.reload()),diagnosed};mountDetailed(shadow,bridge);detailReady=true}$('app').hidden=name==='panel';$('detailHost').hidden=name!=='panel';document.querySelector('header').hidden=name==='panel';document.body.classList.remove('switching')}
+async function switchPanel(name){if(!['main','panel'].includes(name))return;document.body.classList.add('switching');await new Promise(r=>setTimeout(r,300));if(name==='panel'&&!detailReady){let d=await request('/view',{view:'panel'});let host=$('detailHost');let shadow=host.attachShadow({mode:'open'});let style=document.createElement('style');style.textContent=d.style;let content=document.createElement('div');content.innerHTML=d.markup;shadow.append(style,content);let bridge={call:request,detail:async action=>({json:async()=>request('/detail',{action})}),expired:()=>location.reload(),switch:switchPanel,modules:moduleWindow,all:allServices,toggle:toggleService,port:portWindow,logout:()=>request('/logout',{}).then(()=>location.reload()),diagnosed};mountDetailed(shadow,bridge);detailReady=true}$('app').hidden=name==='panel';$('detailHost').hidden=name!=='panel';document.querySelector('header').hidden=name==='panel';document.body.classList.remove('switching')}
 $('detail').onclick=()=>switchPanel('panel');$('defaultMain').onclick=async()=>{try{await request('/preferences',{default_panel:'main'});notice('主面板已设为默认')}catch(e){notice(e.message)}};
 async function toggleService(m){if(m.id==='panel'){return switchPanel('panel')}let p=await request('/service/prepare',{id:m.id,enabled:!m.active});if(!confirm(p.warning))return;await request('/service/apply',{confirmation:p.confirmation});}
 async function allServices(){let d=await request('/modules',{});let eligible=d.modules.filter(m=>m.visible&&m.id!=='panel');let enable=eligible.some(m=>!m.active);let p=await request('/service/prepare',{id:'all',enabled:enable});if(!confirm(p.warning))return;await request('/service/apply',{confirmation:p.confirmation});await refresh()}
@@ -65,6 +65,7 @@ class Server(HTTPServer):
         self.csrf_key = secrets.token_bytes(32)
         self.tasks = queue.Queue(maxsize=2)
         super().__init__(address, handler)
+        self.panel_backend.port=self.server_port
         for i in range(2):
             threading.Thread(target=self.worker, name='http-'+str(i), daemon=True).start()
 
@@ -220,8 +221,10 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(503,{'error':'change committed; event backup pending; do not retry blindly','committed':True})
         except Busy as exc:
             self.reply(503,{'error':str(exc)})
-        except (AuthError,ServiceError,TypeError,ValueError):
-            self.reply(403,{'error':'request rejected'})
+        except (AuthError,ServiceError) as exc:
+            self.reply(403,{'error':str(exc)})
+        except (TypeError,ValueError):
+            self.reply(403,{'error':'invalid request'})
         except Exception:
             self.reply(503,{'error':'operation outcome requires verification'})
 
@@ -232,6 +235,11 @@ def cli():
     p.add_argument('--resource-profile',required=True,help='private JSON of measured incremental profiles and reserve bytes')
     p.add_argument('--restore-fresh',help='encrypted external backup; trusted terminal, empty vault only')
     p.add_argument('--initialize',action='store_true',help='trusted terminal bootstrap; do not expose through HTTP')
+    p.add_argument('--xray-config',default='/usr/local/etc/xray/config.json')
+    p.add_argument('--cloud-config',help='existing operator-managed Cloudflared configuration; never rewritten')
+    p.add_argument('--single-writer',action='store_true',help='operator attests this process is the only Xray config writer')
+    p.add_argument('--task-memory-max',type=int,help='measured isolated test task cgroup cap in bytes; no invented default')
+    p.add_argument('--task-slice',help='administrator-provisioned isolated management slice')
     p.add_argument('--bind',default='127.0.0.1')
     p.add_argument('--port',type=int,required=True)
     p.add_argument('--origin',required=True,help='exact public HTTPS origin')
@@ -262,7 +270,36 @@ def cli():
             return
         active.start_monitor()
         coordinator=Coordinator(auth,active,gate)
-        coordinator.discovery=Discovery(active)
+        coordinator.discovery=Discovery(active,args.xray_config,args.cloud_config)
+        import shutil
+        launcher=None
+        if args.task_memory_max is not None:
+            import re
+            if not 0 < args.task_memory_max < 200_000_000 or not args.task_slice or not re.fullmatch(r'[A-Za-z0-9_.-]+\.slice',args.task_slice):
+                p.error('measured positive task cap and administrator-provisioned slice required')
+            binary=shutil.which('systemd-run')
+            if binary is None:p.error('systemd-run unavailable')
+            def launcher(argv):
+                return [binary,'--quiet','--wait','--pipe','--collect','--slice='+args.task_slice,
+                        '--property=MemoryMax='+str(args.task_memory_max),'--property=TasksMax=16',
+                        '--property=RuntimeMaxSec=45','--property=KillMode=control-group',
+                        '--property=Nice=10','--',*argv]
+        runner=BoundedCommand(gate,launcher)
+        executable=shutil.which('xray')
+        if args.single_writer and executable:
+            tester=XraySelfTest(runner,executable)
+            x=XrayTransaction(auth.store,args.xray_config,gate,tester,active,auth.validate)
+            x.single_writer=True;coordinator.xray=x
+        def readiness(name):
+            info=coordinator.discovery.inspect(name)
+            if info['readiness']!='requires_validation':raise ServiceError('service not installed/configured')
+            if name=='xray':
+                if coordinator.xray is None:raise ServiceError('single-writer test backend unavailable')
+                with gate('xray-test'):coordinator.xray.test(coordinator.xray._read()[0])
+            else:
+                # Unknown Cloudflared CLI cannot be guessed or config rewritten.
+                raise ServiceError('Cloudflared executable/config validation not certified for this version')
+        active.readiness=readiness
         server=Server((args.bind,args.port),Handler,coordinator,args.origin)
         try: server.serve_forever()
         finally: server.server_close()

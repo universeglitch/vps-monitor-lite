@@ -307,7 +307,7 @@ $('defaultPanel').onclick=()=>bridge.call('/preferences',{default_panel:'panel'}
 $('detailModules').onclick=bridge.modules;
 $('detailAll').onclick=bridge.all;
 refresh();loadConfig().catch(e=>{$('detailOperation').textContent=e.message});
-// Network diagnostics are explicit on detailed-page entry, not on every switch.
+// Network diagnostics run once per browser session, not on every switch.
 if(!bridge.diagnosed){bridge.diagnosed=true;refreshNetwork()}
 </script></body></html>"""
 

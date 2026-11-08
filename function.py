@@ -649,10 +649,14 @@ class PanelBackend:
             if net=='ws' and security!='reality':kinds['ws']=True
             if net=='xhttp' and security!='reality':kinds['xhttp']=True
             if net in ('raw','tcp') and security=='reality':kinds['reality']=True
+        from auth import loads
+        disabled_raw=self.store.read('disabled-inbounds.json',missing=True)
+        disabled=loads(disabled_raw) if disabled_raw else {}
         for kind,label in [('ws','WS + TLS'),('xhttp','XHTTP'),('reality','REALITY (RAW/TCP)')]:
             unit=state['services'].get('xray',{});configured=kinds[kind]
-            st='未安装' if not unit.get('installed') else '已安装但未配置' if not configured else '正在运行' if unit.get('active') else '已配置但未启动'
-            mods.append({'id':kind,'name':label,'state':st,'active':bool(configured and unit.get('active')),'visible':bool(configured and unit.get('installed')),'configured':configured,'installed':bool(unit.get('installed'))})
+            saved={'ws':'vps-monitor-ws','xhttp':'vps-monitor-xhttp','reality':'vps-monitor-reality'}[kind] in disabled
+            st='未安装' if not unit.get('installed') else '已停止' if saved and not configured else '已安装但未配置' if not configured else '正在运行' if unit.get('active') else '已配置但未启动'
+            mods.append({'id':kind,'name':label,'state':st,'active':bool(configured and unit.get('active')),'visible':bool((configured or saved) and unit.get('installed')),'configured':configured,'installed':bool(unit.get('installed'))})
         cloud=state['services'].get('cloudflared',{});configured=False
         if self.c.discovery and self.c.discovery.cloud_config:
             path=self.c.discovery.cloud_config;configured=path.is_file() and not path.is_symlink() and path.stat().st_size>0
@@ -702,7 +706,8 @@ class PanelBackend:
             now=time.monotonic();self.permits={k:v for k,v in self.permits.items() if v['expires']>now}
             if len(self.permits)>=16:raise Busy('confirmation capacity reached')
             ident=secrets.token_hex(32);payload.update(epoch=self.c.auth.validate(token),session=hashlib.sha256(token.encode()).hexdigest(),expires=now+120)
-            self.permits[ident]=payload;return ident
+            import copy
+            self.permits[ident]=copy.deepcopy(payload);return ident
 
     def _consume(self, token, ident):
         import hashlib
@@ -712,26 +717,54 @@ class PanelBackend:
         return r
 
     def prepare_service(self, token, ident, enabled):
+        from auth import loads,dumps
         if type(enabled) is not bool:raise AuthError('invalid switch value')
         modules=self.modules(token)['modules']
         selected=[m for m in modules if (m['id']==ident or ident=='all') and m['visible'] and m['id']!='panel']
+        # Previously disabled owned inbounds have valid saved definitions.
+        saved_raw=self.store.read('disabled-inbounds.json',missing=True)
+        saved=loads(saved_raw) if saved_raw else {}
+        if enabled:
+            for k,tag in [('ws','vps-monitor-ws'),('xhttp','vps-monitor-xhttp'),('reality','vps-monitor-reality')]:
+                if (ident in (k,'all')) and tag in saved and not any(m['id']==k for m in selected):
+                    selected.append({'id':k,'name':k,'active':False,'visible':True})
         if not selected:raise AuthError('no configured services selected')
-        # Shared Xray cannot independently stop a user inbound. Only explicit
-        # project-owned inbound changes may use config transaction.
-        if any(m['id'] in ('ws','xhttp','reality') for m in selected):
-            raise AuthError('入站开关需已登记的本项目入站及配置事务；请先通过配置向导创建，不能停止共享 Xray 影响其他入站')
-        permit=self._permit(token,{'op':'service','services':[m['id'] for m in selected],'enabled':enabled})
-        return {'confirmation':permit,'warning':'确认'+('启动' if enabled else '停止')+' '+', '.join(m['name'] for m in selected)+'？停止会中断相应代理连接。'}
+        xray_selected=[m for m in selected if m['id'] in ('ws','xhttp','reality')]
+        cloud_selected=[m for m in selected if m['id']=='cloudflared']
+        if xray_selected:
+            data=self._configuration();bytag={i.get('tag'):i for i in data['inbounds'] if i.get('tag')}
+            replacements={};new_saved=dict(saved)
+            for m in xray_selected:
+                tag={'ws':'vps-monitor-ws','xhttp':'vps-monitor-xhttp','reality':'vps-monitor-reality'}[m['id']]
+                if tag not in self.owned():raise AuthError('该入站为用户配置，不能自动接管或停止共享 Xray')
+                if enabled:
+                    if tag in bytag:continue
+                    if tag not in saved:raise AuthError('没有已验证的停用入站配置')
+                    replacements[tag]=saved[tag];new_saved.pop(tag,None)
+                elif tag in bytag:
+                    replacements[tag]=None;new_saved[tag]=bytag[tag]
+            if replacements:
+                # Save definitions before disabling; they are inert, never written
+                # into Xray without a separately validated confirmed transaction.
+                preview=self.preview_mapping(token,replacements)
+                with self.permit_lock:
+                    self.permits[preview['confirmation']]['cloud_after']=enabled if cloud_selected else None
+                    self.permits[preview['confirmation']]['disabled_after']=new_saved
+                return preview
+        permit=self._permit(token,{'op':'service','services':[m['id'] for m in cloud_selected],'enabled':enabled})
+        return {'confirmation':permit,'warning':'确认'+('启动' if enabled else '停止')+' '+', '.join(m['name'] for m in selected)+'？停止会中断相应连接。未选择的用户入站保持不变。'}
 
     def apply_service(self, token, ident):
         r=self._consume(token,ident)
+        if r['op']=='config':
+            result=self._apply_record(token,r)
+            if r.get('cloud_after') is not None:
+                try:self.c.active.set_service('cloudflared',r['cloud_after'])
+                except Exception as exc:
+                    raise AuthError('Xray 已提交，但 Cloudflared 切换失败；请刷新查看真实状态，不要盲目重试') from exc
+            return result
         if r['op']!='service':raise AuthError('confirmation type mismatch')
-        results=[]
-        for name in r['services']:
-            if r['enabled']:
-                if self.c.active.readiness is None:raise AuthError('启动验证器未配置，拒绝启动')
-            results.append(self.c.active.set_service(name,r['enabled']))
-        return {'results':results}
+        return {'results':[self.c.active.set_service(name,r['enabled']) for name in r['services']]}
 
     def schema(self, token, kind):
         self.c.auth.validate(token)
@@ -850,9 +883,15 @@ class PanelBackend:
     def apply_candidate(self, token, ident):
         r=self._consume(token,ident)
         if r['op']!='config':raise AuthError('confirmation type mismatch')
+        return self._apply_record(token,r)
+
+    def _apply_record(self, token, r):
         x=self.c.xray
+        if x is None or getattr(x,'single_writer',False) is not True:raise AuthError('single-writer Xray backend unavailable')
         if x.fingerprint(x._read()[0])!=r['hash']:raise AuthError('config changed after preview')
-        # Internal second confirmation is generated only after the exact validated
-        # candidate was approved by this authenticated user.
         permit=x.confirm(token)
-        return x.configure(token,permit['confirmation'],r['replacements'])
+        result=x.configure(token,permit['confirmation'],r['replacements'])
+        if 'disabled_after' in r:
+            from auth import dumps
+            self.store.write('disabled-inbounds.json',dumps(r['disabled_after']))
+        return result

@@ -42,3 +42,25 @@ class WebTests(unittest.TestCase):
         self.assertEqual(status,200);self.assertIn('key',json.loads(b));self.assertEqual(h['Cache-Control'],'no-store')
     def test_bootstrap_not_exposed(self):
         self.assertEqual(self.request('/initialize',{})[0],403)
+
+class DualEntryTests(WebTests):
+    def authenticated(self):
+        _,h,_=self.request('/login',{'password':'synthetic-test-password-123'})
+        cookie=h['Set-Cookie'].split(';')[0]
+        _,_,b=self.request('/session',headers={'Cookie':cookie})
+        return {'Cookie':cookie,'X-CSRF-Token':json.loads(b)['csrf']}
+    def test_same_entry_no_panel_route(self):
+        status,h,b=self.request('/')
+        self.assertEqual(status,200);self.assertIn(b'mountDetailed',b)
+        self.assertNotIn(b'<iframe',b)
+        self.assertEqual(self.request('/panel')[0],401)
+        self.assertEqual(self.request('/view',{'view':'panel'})[0],403)
+        headers=self.authenticated()
+        status,h,b=self.request('/view',{'view':'panel'},headers)
+        self.assertEqual(status,200);self.assertIn('markup',json.loads(b))
+        self.assertEqual(self.request('/preferences',{'default_panel':'panel'},headers)[0],200)
+        status,h,b=self.request('/preferences',{},headers)
+        self.assertEqual(json.loads(b)['default_panel'],'panel')
+    def test_missing_config_hides_nodes(self):
+        h=self.authenticated();status,_,b=self.request('/nodes',{},h)
+        self.assertEqual(status,200);self.assertEqual(json.loads(b)['nodes'],[])
