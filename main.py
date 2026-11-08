@@ -21,15 +21,15 @@ from urllib.parse import urlsplit
 
 from active import Active, ServiceError
 from auth import Auth, AuthError, BackupPending, Busy, Corrupt, loads, b64, unb64
-from function import Coordinator, Memory, ResourceGate
+from function import Coordinator, Memory, ResourceGate, PanelBackend, Discovery
 
 PAGE = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VPS Monitor</title>
-<style>*{box-sizing:border-box}body{margin:0;color:#eef0ff;font:16px system-ui;background:linear-gradient(145deg,#0c1938,#26143d);min-height:100vh}main{max-width:620px;margin:32px auto;padding:20px}header{padding:24px;border-radius:22px;background:linear-gradient(120deg,#2163aa,#6542b0)}section{background:#141a34cc;border:1px solid #ffffff12;border-radius:20px;padding:20px;margin-top:18px;backdrop-filter:blur(12px)}.row{display:flex;justify-content:space-between;align-items:center;padding:14px 0;gap:12px}.switch{width:54px;height:30px;border-radius:20px;background:#414466;position:relative;transition:background .3s ease-in-out}.switch:after{content:'';position:absolute;width:22px;height:22px;left:4px;top:4px;border-radius:50%;background:white;transition:transform .3s ease-in-out}.switch.on{background:#35ac73}.switch.on:after{transform:translateX(24px)}button{color:inherit;background:#413578;border:0;border-radius:12px;padding:12px;cursor:pointer}button:active{transform:scale(.98)}button:disabled{opacity:.5;cursor:not-allowed}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.all{display:flex;align-items:center;flex-direction:column;gap:10px;color:#6cb8ff}.all .switch{background:#814fc1}input,select{display:block;width:100%;padding:12px;margin:10px 0;border:1px solid #454969;border-radius:10px;background:#11172e;color:white}dialog{width:min(90vw,430px);background:#18213e;color:white;border:1px solid #58508a;border-radius:18px}dialog::backdrop{background:#0009}#notice{white-space:pre-wrap;font-size:14px;color:#f5cd8e}small{color:#aeb9d4}.secret{overflow-wrap:anywhere}</style>
+<style>*{box-sizing:border-box}body{margin:0;color:#eef0ff;font:16px system-ui;background:linear-gradient(145deg,#0c1938,#26143d);min-height:100vh}body{opacity:1;transition:opacity .3s ease-in-out}body.switching{opacity:0}main{max-width:620px;margin:32px auto;padding:20px}header{padding:24px;border-radius:22px;background:linear-gradient(120deg,#2163aa,#6542b0)}section{background:#141a34cc;border:1px solid #ffffff12;border-radius:20px;padding:20px;margin-top:18px;backdrop-filter:blur(12px)}.row{display:flex;justify-content:space-between;align-items:center;padding:14px 0;gap:12px}.switch{width:54px;height:30px;border-radius:20px;background:#414466;position:relative;transition:background .3s ease-in-out}.switch:after{content:'';position:absolute;width:22px;height:22px;left:4px;top:4px;border-radius:50%;background:white;transition:transform .3s ease-in-out}.switch.on{background:#35ac73}.switch.on:after{transform:translateX(24px)}button{color:inherit;background:#413578;border:0;border-radius:12px;padding:12px;cursor:pointer}button:active{transform:scale(.98)}button:disabled{opacity:.5;cursor:not-allowed}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.all{display:flex;align-items:center;flex-direction:column;gap:10px;color:#6cb8ff}.all .switch{background:#814fc1}input,select{display:block;width:100%;padding:12px;margin:10px 0;border:1px solid #454969;border-radius:10px;background:#11172e;color:white}dialog{width:min(90vw,430px);background:#18213e;color:white;border:1px solid #58508a;border-radius:18px}dialog::backdrop{background:#0009}#notice{white-space:pre-wrap;font-size:14px;color:#f5cd8e}small{color:#aeb9d4}.secret{overflow-wrap:anywhere}</style>
 <main><header><h1>VPS Monitor</h1><small>统一节点管理 · plus 开发版</small></header>
 <section id="login"><h2>管理密码登录</h2><input id="password" type="password" autocomplete="current-password"><button id="loginButton">登录</button><small>首次初始化请使用受限本机终端，不接受公网抢先初始化。</small></section>
-<div id="app" hidden><section><div class="all"><span>一键开关</span><button class="switch" id="all" disabled title="未配置协议和重启确认流程，拒绝执行"></button></div><div id="services"></div></section><section class="grid"><button id="api">API 管理</button><button id="manage">管理功能</button><button disabled>设为默认面板</button><button id="detail" disabled>切换到详细面板</button></section><button id="logout">退出当前设备</button></div><p id="notice" role="status"></p>
+<div id="app" hidden><section><div class="all"><span>一键开关</span><button class="switch" id="all" disabled title="未配置协议和重启确认流程，拒绝执行"></button></div><div id="services"></div></section><section class="grid"><button id="api">API 管理</button><button id="manage">管理功能</button><button id="modules">模块管理</button><button id="defaultMain">设为默认面板</button><button id="detail">切换到详细面板</button></section><button id="logout">退出当前设备</button></div><div id="detailHost" hidden></div><p id="notice" role="status"></p>
 <dialog id="modal"><h2 id="title"></h2><div id="body"></div><button id="close">确认关闭</button></dialog></main><script>
-'use strict';let csrf='';const $=s=>document.getElementById(s);function notice(t){$('notice').textContent=t}async function request(path,data){let r=await fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json','X-CSRF-Token':csrf}:{},body:data?JSON.stringify(data):undefined,cache:'no-store'});let j=await r.json();if(!r.ok)throw Error(j.error||'操作失败');return j}function button(t,fn){let b=document.createElement('button');b.textContent=t;b.onclick=async()=>{try{await fn()}catch(e){notice(e.message)}};return b}function show(title){$('title').textContent=title;$('body').replaceChildren();$('modal').showModal();return $('body')}async function refresh(){let s=await request('/session');csrf=s.csrf;$('login').hidden=true;$('app').hidden=false;let st=await request('/status');$('services').replaceChildren();for(let [label,id] of [['WS + TLS','ws'],['XHTTP','xhttp'],['WS + Reality','reality'],['Cloudflared','cloudflared'],['详细面板','panel'],['测活','heartbeat']]){let row=document.createElement('div');row.className='row';let text=document.createElement('span');text.textContent=label;let b=button('',async()=>{if(id==='heartbeat'){await request('/heartbeat',{enabled:!st.heartbeat});await refresh()}else{notice('本项尚未完成安全配置/确认流程，当前拒绝操作，不会自动安装或重启')}});let on=id==='heartbeat'?st.heartbeat:id==='cloudflared'&&st.services.cloudflared.active;b.className='switch'+(on?' on':'');b.setAttribute('aria-label',label);b.setAttribute('aria-pressed',String(!!on));if(id!=='heartbeat')b.disabled=true;row.append(text,b);$('services').append(row)}}
+'use strict';let csrf='';const $=s=>document.getElementById(s);function notice(t){$('notice').textContent=t}async function request(path,data){let r=await fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json','X-CSRF-Token':csrf}:{},body:data?JSON.stringify(data):undefined,cache:'no-store'});let j=await r.json();if(!r.ok)throw Error(j.error||'操作失败');return j}function button(t,fn){let b=document.createElement('button');b.textContent=t;b.onclick=async()=>{try{await fn()}catch(e){notice(e.message)}};return b}function show(title){$('title').textContent=title;$('body').replaceChildren();$('modal').showModal();return $('body')}async function refresh(){let s=await request('/session');csrf=s.csrf;$('login').hidden=true;$('app').hidden=false;let st=await request('/modules',{});$('services').replaceChildren();for(let [label,id] of st.modules.filter(m=>m.visible).map(m=>[m.name,m.id]).concat([['测活','heartbeat']])){let row=document.createElement('div');row.className='row';let text=document.createElement('span');text.textContent=label;let b=button('',async()=>{if(id==='heartbeat'){await request('/heartbeat',{enabled:!st.heartbeat});await refresh()}else{await toggleService(st.modules.find(m=>m.id===id));await refresh()}});let on=id==='heartbeat'?st.heartbeat:!!st.modules.find(m=>m.id===id)?.active;b.className='switch'+(on?' on':'');b.setAttribute('aria-label',label);b.setAttribute('aria-pressed',String(!!on));row.append(text,b);$('services').append(row)}}
 $('loginButton').onclick=async()=>{try{await request('/login',{password:$('password').value});$('password').value='';await refresh();notice('')}catch(e){$('password').value='';notice(e.message)}};$('logout').onclick=async()=>{try{await request('/logout',{});location.reload()}catch(e){notice(e.message)}};$('close').onclick=()=>{$('body').replaceChildren();$('modal').close()};
 $('api').onclick=()=>{let body=show('API 管理');body.append(button('生成 API Key',async()=>{return fields('生成 API Key',[['name','API 名称','text']],async data=>{let j=await request('/api/create',data);let box=show('API Key');let p=document.createElement('p');p.className='secret';p.textContent=j.key;box.append(p,button('复制',async()=>navigator.clipboard.writeText(j.key)))});} ),button('读取 API Key',async()=>{let j=await request('/api/list');let box=show('选择 API');for(let r of j.items){let row=document.createElement('div');row.className='row';row.append(button(r.name,async()=>{let k=await request('/api/read',{ident:r.id});let b=show(r.name);let p=document.createElement('p');p.className='secret';p.textContent=k.key;b.append(p,button('复制',async()=>navigator.clipboard.writeText(k.key)))}),button('删除',async()=>{if(!confirm('确认删除 API：'+r.name+'？'))return;await request('/api/delete',{ident:r.id,confirmation_name:r.name});row.remove()}));box.append(row)}}))};
 async function fields(title, items, perform){let box=show(title);let inputs={};for(let item of items){let label=document.createElement('label');label.textContent=item[1];let input=document.createElement('input');input.type=item[2]||'password';input.autocomplete='off';inputs[item[0]]=input;label.append(input);box.append(label)}box.append(button('确认执行',async()=>{let data={};for(let [k,v] of Object.entries(inputs)){data[k]=v.value;v.value=''}await perform(data)}))}
@@ -42,13 +42,26 @@ button('恢复本地备份',async()=>{let b=show('选择本地备份');for(let s
 button('轮换主密钥',async()=>{if(!confirm('确认轮换 LMK/KEK/DEK，并触发加密备份？'))return;let r=await request('/keys/rotate',{});notice('密钥已轮换，版本 '+r.version)}),
 button('清理无引用对象',async()=>{if(!confirm('仅清理不被当前状态和本地备份引用的对象？'))return;let r=await request('/keys/cleanup',{});notice('已清理对象 '+r.removed)}))};
 $('login').append(button('忘记密码',()=>fields('恢复密码',[['recovery','恢复密钥'],['new','新管理密码'],['confirmation','确认密码']],async d=>{let r=await request('/recover',d);let b=show('新恢复密钥（仅本次展示）');let p=document.createElement('p');p.className='secret';p.textContent=r.recovery;b.append(p,button('复制',()=>navigator.clipboard.writeText(r.recovery)));notice('密码已恢复；旧恢复密钥和全部旧 Session 已失效')})));
-refresh().catch(()=>{});
+let detailReady=false, diagnosed=false;
+async function switchPanel(name){if(!['main','panel'].includes(name))return;document.body.classList.add('switching');await new Promise(r=>setTimeout(r,300));if(name==='panel'&&!detailReady){let d=await request('/view',{view:'panel'});let host=$('detailHost');let shadow=host.attachShadow({mode:'closed'});let style=document.createElement('style');style.textContent=d.style;let content=document.createElement('div');content.innerHTML=d.markup;shadow.append(style,content);let bridge={call:request,detail:async action=>({json:async()=>request('/detail',{action})}),expired:()=>location.reload(),switch:switchPanel,modules:moduleWindow,all:allServices,toggle:toggleService,port:portWindow,logout:()=>request('/logout',{}).then(()=>location.reload()),diagnosed};mountDetailed(shadow,bridge);detailReady=true}$('app').hidden=name==='panel';$('detailHost').hidden=name!=='panel';document.querySelector('header').hidden=name==='panel';document.body.classList.remove('switching')}
+$('detail').onclick=()=>switchPanel('panel');$('defaultMain').onclick=async()=>{try{await request('/preferences',{default_panel:'main'});notice('主面板已设为默认')}catch(e){notice(e.message)}};
+async function toggleService(m){if(m.id==='panel'){return switchPanel('panel')}let p=await request('/service/prepare',{id:m.id,enabled:!m.active});if(!confirm(p.warning))return;await request('/service/apply',{confirmation:p.confirmation});}
+async function allServices(){let d=await request('/modules',{});let eligible=d.modules.filter(m=>m.visible&&m.id!=='panel');let enable=eligible.some(m=>!m.active);let p=await request('/service/prepare',{id:'all',enabled:enable});if(!confirm(p.warning))return;await request('/service/apply',{confirmation:p.confirmation});await refresh()}
+$('all').disabled=false;$('all').onclick=()=>allServices().catch(e=>notice(e.message));
+async function moduleWindow(){let d=await request('/modules',{});let b=show('模块管理');for(let m of d.modules){let row=document.createElement('section');let t=document.createElement('p');t.textContent=m.name+' · '+m.state;row.append(t);if(!m.installed)row.append(button('安装',async()=>{let p=await request('/module/install',{service:m.id});if(!confirm('确认安装 '+m.name+'？缺少：'+(p.missing||[]).join('、')))return;notice('正在验证和安装…');let result=await request('/module/install',{service:m.id,confirmation:p.confirmation});notice(JSON.stringify(result));$('modal').close();await moduleWindow()}));if(['ws','xhttp','reality'].includes(m.id))row.append(button('配置向导',()=>wizard(m.id)));if(m.id==='cloudflared')row.append(button('Cloudflare 配置指导',cloudGuide));b.append(row)}}
+$('modules').onclick=()=>moduleWindow().catch(e=>notice(e.message));
+async function cloudGuide(){let d=await request('/cloud-guide',{});let b=show(d.title);for(let text of [d.ws_rule,d.panel_rule]){let p=document.createElement('p');p.textContent=text;b.append(p,button('复制',()=>navigator.clipboard.writeText(text)))}let note=document.createElement('p');note.textContent=d.note;b.append(note)}
+async function wizard(kind){let schema=await request('/xray/schema',{kind});let b=show(schema.title);let note=document.createElement('p');note.textContent=schema.description;b.append(note);let inputs={};for(let f of schema.fields){let label=document.createElement('label');label.textContent=f.label+(f.required?' *':'（可选）')+' — '+f.help;let el=document.createElement('input');el.type=f.secret?'password':'text';el.autocomplete='off';el.value=f.value||'';inputs[f.name]=el;label.append(el);b.append(label)}b.append(button('验证候选配置与查看差异',async()=>{let values={};for(let [k,v] of Object.entries(inputs))values[k]=v.value;let p=await request('/xray/preview',{kind,values});let box=show('确认 Xray 配置变更');let diff=document.createElement('pre');diff.textContent=p.diff;box.append(diff);let warn=document.createElement('p');warn.textContent=p.warning;box.append(warn,button('明确同意应用并重启',async()=>{await request('/xray/apply',{confirmation:p.confirmation});$('modal').close();notice('配置已应用并验证');await refresh()}))}))}
+async function portWindow(port){if(!port.editable){notice(port.reason||'该端口不属于本项目，禁止修改');return}return fields('修改端口 '+port.name+'（当前 '+port.port+'）',[['port','新端口','number']],async data=>{let p=await request('/port/preview',{id:port.id,port:data.port});let b=show('端口变更确认');let diff=document.createElement('pre');diff.textContent=p.diff;b.append(diff,button('确认应用并重启 Xray',async()=>{await request('/xray/apply',{confirmation:p.confirmation});$('modal').close();notice('端口变更完成')}))})}
+refresh().then(async()=>{let p=await request('/preferences',{});if(p.default_panel==='panel')await switchPanel('panel')}).catch(()=>{});
+
 </script></html>'''
 
 
 class Server(HTTPServer):
     def __init__(self, address, handler, coordinator, origin):
         self.coordinator, self.origin = coordinator, origin
+        self.panel_backend = PanelBackend(coordinator,port=address[1] or None)
         self.csrf_key = secrets.token_bytes(32)
         self.tasks = queue.Queue(maxsize=2)
         super().__init__(address, handler)
@@ -102,7 +115,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','no-referrer')
-        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.send_header('Content-Security-Policy',"default-src 'self'; connect-src 'self' https://www.baidu.com https://www.taobao.com https://www.google.com https://www.youtube.com https://github.com https://chatgpt.com https://claude.ai https://gemini.google.com; img-src 'self' data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         if cookie is not None: self.send_header('Set-Cookie',cookie)
         self.end_headers(); self.wfile.write(raw)
 
@@ -110,7 +123,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.headers.get('Host') != urlsplit(self.server.origin).netloc:
                 raise AuthError('unexpected Host')
-            if self.path == '/': return self.reply(200,PAGE,html=True)
+            if self.path == '/':
+                import panel
+                script=panel.render_components()[2]
+                entry=PAGE.replace('<script>', '<script>function mountDetailed(root,bridge){'+script+'}\n',1)
+                return self.reply(200,entry,html=True)
             token=self.token(); self.server.coordinator.auth.validate(token)
             if self.path == '/session': return self.reply(200,{'csrf':self.csrf(token)})
             if self.path == '/status': return self.reply(200,self.server.coordinator.status(token))
@@ -148,6 +165,29 @@ class Handler(BaseHTTPRequestHandler):
             token=self.token(); c.auth.validate(token)
             if not hmac.compare_digest(self.headers.get('X-CSRF-Token',''),self.csrf(token)):
                 raise AuthError('CSRF rejected')
+            backend=self.server.panel_backend
+            if self.path == '/view':
+                if data.get('view')!='panel': raise AuthError('invalid view')
+                import panel
+                panel.authorize(c,token)
+                style,markup,script=panel.render_components()
+                return self.reply(200,{'style':style,'markup':markup})
+            if self.path == '/preferences':return self.reply(200,backend.preferences(token,data.get('default_panel')))
+            if self.path == '/modules':return self.reply(200,backend.modules(token))
+            if self.path == '/nodes':return self.reply(200,{'nodes':backend.nodes(token)})
+            if self.path == '/node/name':return self.reply(200,backend.rename(token,data.get('id'),data.get('name')))
+            if self.path == '/node/share':return self.reply(200,{'uri':backend.share(token,data.get('id'))})
+            if self.path == '/node/qr':return self.reply(200,{'image':backend.qr(token,data.get('id'))})
+            if self.path == '/ports':return self.reply(200,{'ports':backend.ports(token)})
+            if self.path == '/cloud-guide':return self.reply(200,backend.guide(token))
+            if self.path == '/detail':return self.reply(200,backend.detail(token,data.get('action'),self.headers))
+            if self.path == '/module/install':return self.reply(200,c.install(token,data.get('service'),data.get('confirmation')))
+            if self.path == '/service/prepare':return self.reply(200,backend.prepare_service(token,data.get('id'),data.get('enabled')))
+            if self.path == '/service/apply':return self.reply(200,backend.apply_service(token,data.get('confirmation')))
+            if self.path == '/xray/schema':return self.reply(200,backend.schema(token,data.get('kind')))
+            if self.path == '/xray/preview':return self.reply(200,backend.preview(token,data.get('kind'),data.get('values')))
+            if self.path == '/port/preview':return self.reply(200,backend.port_preview(token,data.get('id'),data.get('port')))
+            if self.path == '/xray/apply':return self.reply(200,backend.apply_candidate(token,data.get('confirmation')))
             if self.path == '/logout':
                 c.auth.logout(token)
                 return self.reply(200,{'ok':True},'__Host-vps_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0')
@@ -174,7 +214,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/keys/cleanup':
                 return self.reply(200,{'removed':c.auth.collect_objects(token)})
             if self.path == '/heartbeat':
-                c.active.set_heartbeat(data.get('enabled')); return self.reply(200,{'ok':True})
+                c.auth.validate(token); c.active.set_heartbeat(data.get('enabled')); return self.reply(200,{'ok':True})
             raise AuthError('operation unavailable')
         except BackupPending:
             self.reply(503,{'error':'change committed; event backup pending; do not retry blindly','committed':True})
@@ -221,7 +261,9 @@ def cli():
             print('恢复密钥仅展示一次：',recovery)
             return
         active.start_monitor()
-        server=Server((args.bind,args.port),Handler,Coordinator(auth,active,gate),args.origin)
+        coordinator=Coordinator(auth,active,gate)
+        coordinator.discovery=Discovery(active)
+        server=Server((args.bind,args.port),Handler,coordinator,args.origin)
         try: server.serve_forever()
         finally: server.server_close()
     finally:

@@ -9,7 +9,6 @@ from urllib.parse import urlsplit, parse_qs, urlencode, quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from io import BytesIO
-import qrcode
 
 AUTH = Path("/etc/node-panel/auth.json")
 KEY = Path("/etc/node-panel/secret.key")
@@ -69,9 +68,13 @@ def load_panel_config():
 
     return cfg
 
-panel_config = load_panel_config()
-auth = json.loads(AUTH.read_text())
-secret_key = KEY.read_bytes()
+# Loaded only by explicit compatibility helpers, never at import/startup.
+panel_config = {}
+
+def authorize(coordinator, token):
+    """Detailed panel uses the same auth.py Session/epoch authority as main."""
+    return coordinator.auth.validate(token)
+
 
 failures = 0
 blocked_until = 0
@@ -111,7 +114,7 @@ button.secondary,.btn.secondary{background:#ffffff16;border:1px solid #ffffff24}
 .value{font-size:17px;font-weight:650}
 .ok{color:#63e6a2}.bad{color:#ff8585}
 .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:15px}
-.qr{width:210px;height:210px;object-fit:contain;background:white;padding:9px;border-radius:12px}
+.qr-cover{position:relative;width:228px;min-height:228px;margin:auto;background:repeating-conic-gradient(#393451 0% 25%,#24283d 0% 50%) 50%/18px 18px;border-radius:14px;display:grid;place-items:center}.qr-cover button{position:absolute;z-index:1}.qr-cover .qr{visibility:hidden;filter:blur(16px)}.qr-cover.revealed .qr{visibility:visible;filter:none}.qr-cover.revealed button{opacity:.8;bottom:0}.qr{width:210px;height:210px;object-fit:contain;background:white;padding:9px;border-radius:12px}
 .hidden{display:none}
 .value{overflow-wrap:anywhere}
 .diag-note{color:#aeb8d8;font-size:12px;line-height:1.7;margin-top:10px}
@@ -121,16 +124,10 @@ hr{border:0;border-top:1px solid #ffffff18;margin:22px 0}
 </style>
 </head>
 <body><main>
-<section class="panel" id="login">
-<h1>Node Monitor</h1><div class="sub">安全登录 · 节点状态管理</div>
-<form id="loginForm">
-<input name="password" type="password" placeholder="面板登录密码" required autocomplete="current-password">
-<button type="submit">登录</button>
-<div class="error" id="loginError"></div>
-</form></section>
+<section class="panel" id="dashboard">
+<h1>Node Monitor</h1><div class="sub">服务状态与节点配置</div><section class="tile" id="unifiedServices"><h2>主面板服务管理</h2><div id="detailServices"></div><div class="actions"><button id="detailAll">一键开关</button><button id="detailModules">模块管理</button><button id="defaultPanel">设为默认面板</button><button id="switchMain">切换面板</button></div><div id="detailOperation" class="diag-note"></div></section>
+<section class="tile"><h2>服务端口管理</h2><div id="portList"></div><small>仅列出真实配置；修改必须经过候选验证及绑定事务的重启确认。</small></section>
 
-<section class="panel hidden" id="dashboard">
-<h1>Node Monitor</h1><div class="sub">服务状态与节点配置</div>
 <div class="grid">
 <div class="tile"><small>Xray 服务</small><div class="value" id="xray">读取中</div></div>
 <div class="tile"><small>Cloudflare Tunnel 服务</small><div class="value" id="tunnel">读取中</div></div>
@@ -175,24 +172,7 @@ hr{border:0;border-top:1px solid #ffffff18;margin:22px 0}
   </div>
   <div class="diag-note" id="networkStatus">登录后自动执行一次网络诊断。</div>
   <hr>
-  <h2 style="font-size:19px">NekoBox 节点配置</h2>
-<div class="sub">根据部署模式显示可用节点配置</div>
-<div class="grid">
-<div class="tile">
-<h3 style="margin:0 0 12px">节点 A · VLESS + WS + TLS</h3>
-<div style="text-align:center"><img class="qr" id="qrWs" alt="WS 节点二维码"></div>
-<div class="actions"><button id="copyWs">复制 WS 分享链接</button>
-<a class="btn secondary" id="downloadWs">下载 WS 配置</a></div>
-<div class="error" id="configErrorWs"></div>
-</div>
-<div class="tile" id="realityTile">
-<h3 style="margin:0 0 12px">节点 B · VLESS + REALITY</h3>
-<div style="text-align:center"><img class="qr" id="qrReality" alt="REALITY 节点二维码"></div>
-<div class="actions"><button id="copyReality">复制 REALITY 分享链接</button>
-<a class="btn secondary" id="downloadReality">下载 REALITY 配置</a></div>
-<div class="error" id="configErrorReality"></div>
-</div>
-</div>
+  <div id="nodesSection" class="hidden"><h2 style="font-size:19px">NekoBox 节点配置</h2><div class="sub">仅展示真实、完整的节点配置；二维码需点击眼睛后才从服务端获取。</div><div class="grid" id="nodeCards"></div></div>
 <hr>
 <div class="actions"><button class="secondary" id="refresh">刷新状态</button>
 <button class="secondary" id="logout">退出登录</button></div>
@@ -200,75 +180,20 @@ hr{border:0;border-top:1px solid #ffffff18;margin:22px 0}
 </section>
 </main>
 <script>
-const $=id=>document.getElementById(id);
+const $=id=>root.getElementById(id);
 const endpoint=location.pathname;
-async function request(action){
- const r=await fetch(endpoint+'?action='+encodeURIComponent(action),{cache:'no-store'});
- if(r.status===401){showLogin();throw Error('登录状态已过期');}
- if(!r.ok)throw Error('请求失败');
- return r;
-}
-function showLogin(){$('dashboard').classList.add('hidden');$('login').classList.remove('hidden');}
-function showDash(){$('login').classList.add('hidden');$('dashboard').classList.remove('hidden');}
+async function request(action){return bridge.detail(action)}
+function showLogin(){bridge.expired()}
+function showDash(){}
 async function refresh(){
- try{
-  const r=await request('status'),s=await r.json();
-  const set=(id,v)=>{$(id).textContent=v?'运行中':'异常';$(id).className='value '+(v?'ok':'bad');};
-  set('xray',s.xray);set('tunnel',s.tunnel);set('nodeA',s.node_a);
- $('nodeBTile').style.display=s.reality_enabled?'':'none';
- if(s.reality_enabled)set('nodeB',s.node_b);
-  $('memory').textContent=s.memory_used+' / '+s.memory_total+' ('+s.memory_percent+'%)';
- }catch(e){}
+ try{const s=await (await request('status')).json();const set=(id,v)=>{if(!$(id))return;$(id).textContent=v?'运行中':'未运行';$(id).className='value '+(v?'ok':'bad')};
+ set('xray',s.xray);set('tunnel',s.tunnel);set('nodeA',s.node_a);$('nodeBTile').style.display=s.reality_enabled?'':'none';if(s.reality_enabled)set('nodeB',s.node_b);$('memory').textContent=s.memory_used+' / '+s.memory_total+' ('+s.memory_percent+'%)';
+ await serviceBlock(); await ports();}catch(e){$('detailOperation').textContent=e.message}
 }
-const shareUris={ws:null,reality:null};
-async function copyNode(kind){
- const errorId=kind==='ws'?'configErrorWs':'configErrorReality';
- const uri=shareUris[kind];
- if(!uri){$(errorId).textContent='配置尚未加载';return;}
- if(navigator.clipboard && navigator.clipboard.writeText){
-  try{await navigator.clipboard.writeText(uri);$(errorId).textContent='已复制分享链接';}
-  catch(e){fallbackCopy(uri,errorId);}
- }else{fallbackCopy(uri,errorId);}
-}
-function fallbackCopy(uri,errorId){
- const box=document.createElement('textarea');
- box.value=uri;box.style.position='fixed';box.style.opacity='0';
- document.body.appendChild(box);box.focus();box.select();
- try{$(errorId).textContent=document.execCommand('copy')?'已复制分享链接':'复制失败，请使用下载配置';}
- catch(e){$(errorId).textContent='复制失败，请使用下载配置';}
- box.remove();
-}
-async function loadConfig(){
- try{
-  const r=await request('config');
-  const d=await r.json();
-
-  const ws=d.nodes && d.nodes.ws;
-  if(!ws || !ws.uri)throw Error('缺少 ws 节点配置');
-
-  shareUris.ws=ws.uri;
-  $('qrWs').src=endpoint+'?action=qr&node=ws&v='+Date.now();
-  $('downloadWs').href=endpoint+'?action=download&node=ws';
-  $('copyWs').onclick=()=>copyNode('ws');
-
-  const reality=d.nodes && d.nodes.reality;
-  const realityEnabled=!!(reality && reality.uri);
-
-  $('realityTile').style.display=realityEnabled?'':'none';
-
-  if(realityEnabled){
-   shareUris.reality=reality.uri;
-   $('qrReality').src=endpoint+'?action=qr&node=reality&v='+Date.now();
-   $('downloadReality').href=endpoint+'?action=download&node=reality';
-   $('copyReality').onclick=()=>copyNode('reality');
-  }else{
-   shareUris.reality=null;
-  }
-
- }catch(e){
-  $('configErrorWs').textContent=e.message;
- }
-}
+function actionButton(label, fn){let b=document.createElement('button');b.textContent=label;b.onclick=async()=>{try{await fn()}catch(e){$('detailOperation').textContent=e.message}};return b}
+async function serviceBlock(){let state=await bridge.call('/modules',{});$('detailServices').replaceChildren();for(let m of state.modules.filter(m=>m.visible)){let row=document.createElement('div');row.className='actions';let label=document.createElement('span');label.textContent=m.name+' · '+m.state;row.append(label,actionButton(m.active?'关闭':'开启',async()=>{await bridge.toggle(m);await refresh()}));$('detailServices').append(row)}let monitor=document.createElement('div');monitor.className='actions';monitor.append(actionButton('测活：'+(state.heartbeat?'开':'关'),async()=>{await bridge.call('/heartbeat',{enabled:!state.heartbeat});await refresh()}));$('detailServices').append(monitor)}
+async function ports(){let d=await bridge.call('/ports',{});$('portList').replaceChildren();for(let p of d.ports){let row=document.createElement('div');row.className='actions';let text=document.createElement('span');text.textContent=p.name+' · '+p.port;row.append(text,actionButton('修改端口',()=>bridge.port(p)));$('portList').append(row)}}
+async function loadConfig(){let d=await bridge.call('/nodes',{});$('nodeCards').replaceChildren();$('nodesSection').classList.toggle('hidden',d.nodes.length===0);for(let node of d.nodes){let card=document.createElement('section');card.className='tile';let title=document.createElement('h3');title.textContent=node.name;let info=document.createElement('p');info.textContent=node.type+' · '+node.address+':'+node.port;card.append(title,info,actionButton('修改名称',async()=>{let name=prompt('节点显示名称',node.name);if(name===null)return;await bridge.call('/node/name',{id:node.id,name});await loadConfig()}));let cover=document.createElement('div');cover.className='qr-cover';let image=document.createElement('img');image.className='qr';image.alt='隐藏的节点二维码';let eye=actionButton('◉ 显示二维码',async()=>{if(image.hasAttribute('src')){image.removeAttribute('src');cover.classList.remove('revealed');eye.textContent='◉ 显示二维码';return}let qr=await bridge.call('/node/qr',{id:node.id});image.src='data:image/svg+xml;base64,'+qr.image;cover.classList.add('revealed');eye.textContent='◉ 隐藏二维码'});cover.append(image,eye);card.append(cover);let actions=document.createElement('div');actions.className='actions';actions.append(actionButton('复制分享链接',async()=>{let d=await bridge.call('/node/share',{id:node.id});await navigator.clipboard.writeText(d.uri)}),actionButton('下载节点配置',async()=>{let d=await bridge.call('/node/share',{id:node.id});let url=URL.createObjectURL(new Blob([d.uri+'\n'],{type:'text/plain'}));let a=document.createElement('a');a.href=url;a.download='node-'+node.id+'.txt';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}));card.append(actions);$('nodeCards').append(card)}}
 const browserTargets=[
  {name:'百度',url:'https://www.baidu.com/'},
  {name:'淘宝',url:'https://www.taobao.com/'},
@@ -374,45 +299,17 @@ async function refreshNetwork(){
  $('networkStatus').textContent='网络诊断完成 · '+new Date().toLocaleTimeString();
 }
 
-$('loginForm').addEventListener('submit',async e=>{
- e.preventDefault();$('loginError').textContent='';
- const body=new URLSearchParams(new FormData(e.target));
- try{
-  const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action=login&'+body.toString()});
-  if(r.ok){showDash();refresh();loadConfig();refreshNetwork();}
-  else $('loginError').textContent=(await r.text())||'登录失败';
- }catch(e){$('loginError').textContent='连接失败';}
-});
-$('refresh').onclick=refresh;
+$('refresh').onclick=()=>{refresh();loadConfig()};
 $('refreshNetwork').onclick=refreshNetwork;
-$('logout').onclick=async()=>{
- await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action=logout'});
- showLogin();
-};
-(async()=>{
- try{const r=await request('status');if(r.ok){showDash();refresh();loadConfig();refreshNetwork();}}
- catch(e){showLogin();}
-})();
+$('logout').onclick=bridge.logout;
+$('switchMain').onclick=()=>bridge.switch('main');
+$('defaultPanel').onclick=()=>bridge.call('/preferences',{default_panel:'panel'}).then(()=>$('detailOperation').textContent='详细面板已设为默认');
+$('detailModules').onclick=bridge.modules;
+$('detailAll').onclick=bridge.all;
+refresh();loadConfig().catch(e=>{$('detailOperation').textContent=e.message});
+// Network diagnostics are explicit on detailed-page entry, not on every switch.
+if(!bridge.diagnosed){bridge.diagnosed=true;refreshNetwork()}
 </script></body></html>"""
-
-def session_token():
-    expiry = str(int(time.time()) + 43200)
-    nonce = secrets.token_hex(16)
-    raw = expiry + "." + nonce
-    sig = hmac.new(secret_key, raw.encode(), hashlib.sha256).hexdigest()
-    return raw + "." + sig
-
-def valid_session(handler):
-    cookie = SimpleCookie()
-    try:
-        cookie.load(handler.headers.get("Cookie", ""))
-        token = cookie["node_session"].value
-        expiry, nonce, sig = token.split(".")
-        raw = expiry + "." + nonce
-        expected = hmac.new(secret_key, raw.encode(), hashlib.sha256).hexdigest()
-        return int(expiry) > int(time.time()) and hmac.compare_digest(sig, expected)
-    except Exception:
-        return False
 
 def service_active(name):
     try:
@@ -731,152 +628,19 @@ def get_server_diagnostics():
     return result
 
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass
 
-    def send_body(self, code, body, content_type="text/plain; charset=utf-8", headers=None):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        if headers:
-            for k, v in headers.items():
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body if isinstance(body, bytes) else body.encode())
+def render_components():
+    """Independent detailed-page markup/script, hosted in one DOM ShadowRoot.
 
-    def authorized(self):
-        if valid_session(self):
-            return True
-        self.send_body(401, "Unauthorized")
-        return False
+    Preserves diagnostics, browser checks, share/download and status areas. No
+    iframe, main-page import, independent listener or legacy authentication.
+    """
+    import re
+    page = PAGE
+    style = re.search(r'<style>(.*?)</style>', page, re.S).group(1)
+    markup = re.search(r'<body>(.*?)<script>', page, re.S).group(1)
+    script = re.search(r'<script>(.*?)</script>', page, re.S).group(1)
+    return style, markup, script
 
-    def do_GET(self):
-        global failures, blocked_until
-        parsed = urlsplit(self.path)
-        if not ALLOWED.fullmatch(parsed.path):
-            self.send_response(302)
-            self.send_header("Location", secrets.choice([
-                "https://eo.52013130.xyz", "https://if.camoo.cyou"
-            ]))
-            self.end_headers()
-            return
-
-        action = parse_qs(parsed.query).get("action", [""])[0]
-        if action == "logout":
-            self.send_body(405, "Method not allowed")
-            return
-        if not action:
-            self.send_body(200, PAGE, "text/html; charset=utf-8")
-            return
-        if not self.authorized():
-            return
-        try:
-            if action == "status":
-                self.send_body(200, json.dumps(get_status()), "application/json")
-            elif action == "visitor":
-                self.send_body(
-                    200,
-                    json.dumps(get_visitor_info(self), ensure_ascii=False),
-                    "application/json"
-                )
-            elif action == "serverdiag":
-                self.send_body(
-                    200,
-                    json.dumps(get_server_diagnostics(), ensure_ascii=False),
-                    "application/json"
-                )
-            elif action == "config":
-                uris = get_uris()
-                nodes = {
-                    "ws": {"uri": uris["ws"]}
-                }
-
-                if panel_config["reality_enabled"]:
-                    nodes["reality"] = {"uri": uris["reality"]}
-
-                self.send_body(
-                    200,
-                    json.dumps({"nodes": nodes}, ensure_ascii=False),
-                    "application/json"
-                )
-            elif action in ("qr", "download"):
-                node = parse_qs(parsed.query).get("node", ["ws"])[0].lower()
-
-                if node not in ("ws", "reality"):
-                    self.send_body(400, "Invalid node")
-                    return
-
-                if node == "reality" and not panel_config["reality_enabled"]:
-                    self.send_body(404, "Reality node is not enabled")
-                    return
-
-                uri = get_uris()[node]
-                if action == "qr":
-                    img = qrcode.make(uri)
-                    buf = BytesIO()
-                    img.save(buf, format="PNG")
-                    self.send_body(200, buf.getvalue(), "image/png")
-                else:
-                    filename = "node-ws.txt" if node == "ws" else "node-reality.txt"
-                    self.send_body(200, uri + "\n", "text/plain; charset=utf-8",
-                                   {"Content-Disposition": f'attachment; filename="{filename}"'})
-            else:
-                self.send_body(404, "Not found")
-        except Exception:
-            self.send_body(500, "配置读取失败，请检查服务器配置")
-
-    def do_POST(self):
-        global failures, blocked_until
-        parsed = urlsplit(self.path)
-        if not ALLOWED.fullmatch(parsed.path):
-            self.send_body(404, "Not found")
-            return
-        try:
-            length = min(int(self.headers.get("Content-Length", "0")), 4096)
-        except (TypeError, ValueError):
-            length = 0
-        form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
-        action = form.get("action", [""])[0]
-
-        if action == "login":
-            with login_lock:
-                now = time.time()
-                if now < blocked_until:
-                    self.send_body(429, "尝试次数过多，请稍后再试")
-                    return
-                password = form.get("password", [""])[0]
-                candidate = hashlib.pbkdf2_hmac(
-                    "sha256", password.encode(), bytes.fromhex(auth["salt"]),
-                    int(auth["iterations"])
-                ).hex()
-                if hmac.compare_digest(candidate, auth["hash"]):
-                    failures = 0
-                    token = session_token()
-                    self.send_body(200, "OK", headers={
-                        "Set-Cookie": f"node_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200"
-                    })
-                else:
-                    failures += 1
-                    if failures >= 5:
-                        failures = 0
-                        blocked_until = now + 300
-                    self.send_body(401, "密码错误")
-            return
-
-        if action == "logout":
-            self.send_body(200, "OK", headers={
-                "Set-Cookie": "node_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
-            })
-            return
-        self.send_body(404, "Not found")
-
-    def do_HEAD(self):
-        self.send_body(405, "Method not allowed")
-
-if __name__ == "__main__":
-    panel_port = int(panel_config.get("panel_port", 8765))
-    if not 1 <= panel_port <= 65535:
-        raise RuntimeError("panel_port 必须在 1–65535 之间")
-    server = ThreadingHTTPServer(("127.0.0.1", panel_port), Handler)
-    server.serve_forever()
+if __name__ == '__main__':
+    raise SystemExit('Detailed panel is a unified-service module. Start main.py; no second listener is opened.')

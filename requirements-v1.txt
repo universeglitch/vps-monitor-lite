@@ -2,3 +2,6 @@
 # Target Debian/wheel compatibility and full transitive hash lock still need validation.
 argon2-cffi==23.1.0
 cryptography==44.0.3
+
+# Detailed-panel on-demand SVG QR; no Pillow needed for SVG.
+qrcode==8.0
