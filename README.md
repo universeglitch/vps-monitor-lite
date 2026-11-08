@@ -592,3 +592,18 @@ T33–T43 边界测试在普通用户和 root 两种身份下均执行，报告�
 首次初始化使用 `--initialize`，只允许交互式本机终端；恢复密钥仅本次输出。灾难恢复使用 `--restore-fresh <外部加密包>`，仅空 vault 可恢复。数据目录不可指向旧面板认证目录，避免格式覆盖。初始化/恢复同样需要显式数据路径、端口、Origin 与资源预算参数。
 
 待实机验收：200,000,000 bytes 无 Swap 峰值、cgroup 祖先约束、OOM、代理高负载、真实 Xray 配置测试和重启回滚、Cloudflared 共存、磁盘写满/断电、UI 两张 V1 基准比对、安装更新峰值及权限部署。没有真实 VPS 测试结果。
+
+
+## plus 双面板统一入口（开发中）
+
+本轮允许修改 panel.py，主/详细面板保留独立实现，共用 main.py 的一个回环HTTP端口、一个URL、一个auth.py Session。切换仅改变页面状态，约300ms过渡；不使用iframe或/main、/panel页面路由。默认面板持久化。不能再把新的panel.py单独作为旧HTTP服务启动；旧unit/安装更新脚本未自动替换，生产部署前先审查兼容影响。
+
+已接入模块窗口、Xray参数向导与候选事务、Cloudflare手动指导、项目入站端口预览、节点命名、按需二维码。二维码首次不加载，点击才鉴权获取；不存在真实完整配置就隐藏节点。Cloudflare入口只需指向统一管理端口，不生成两套Tunnel入口。
+
+详见 [准确实现范围和限制](V1_DEVELOPMENT.md) 及 [本轮实际测试证据](tests/DUAL_PANEL_EVIDENCE.md)。模块二进制下载不等于完整unit/配置就绪；管理监听端口在线修改、真实服务安装和部分启动验证仍未完成，不能把拒绝路径算成完整功能。
+
+### 运行前提
+
+使用独立数据目录、实测resource-profile及明确HTTPS origin启动main.py；--single-writer仅在已确立唯一配置写入者时设置。Xray候选测试需要已存在的xray程序、管理员预建的任务slice和实测task-memory-max。--cloud-config只读取现有配置，程序不自动配置Tunnel。不要同时运行旧面板服务争用同一端口。所有部署切换需管理员明确执行，本轮没有安装或修改真实unit。
+
+测试环境依赖：生产只读取requirements-v1.txt固定依赖，浏览器测试另需开发环境playwright/Chromium，不是生产启动依赖。浏览器模拟测试入口为 tests/browser/dual_panel_smoke.py。真实VPS安装、服务启停、cgroup200MB峰值、端口互通、OOM、断电、自愈及V1视觉基准均待验收。
