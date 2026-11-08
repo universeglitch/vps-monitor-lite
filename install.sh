@@ -1393,7 +1393,7 @@ detect_existing(){
   (( xray_conf ))       && found+=("Xray 配置 $XRAY_CONFIG")
   (( xray_unit ))       && found+=("systemd 单元 $XRAY_SERVICE")
   (( panel_unit ))      && found+=("systemd 单元 $PANEL_SERVICE")
-  (( modules ))        && found+=("Xray systemd drop-in 目录")
+  (( modules ))         && found+=("Xray systemd drop-in 目录")
   [[ -n "$xray_bin" ]]  && found+=("Xray 程序 $xray_bin")
   (( xray_user ))       && found+=("Xray 用户")
   (( xray_group ))      && found+=("Xray 用户组")
@@ -2307,6 +2307,7 @@ if reality_enabled == "1":
             "realitySettings": {
                 "show": False,
                 "dest": target,
+                "xver": 0,
                 "serverNames": [sni],
                 "privateKey": private_key,
                 "shortIds": [short_id]
