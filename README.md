@@ -2,12 +2,25 @@
 
 本项目使用 systemd 管理 Xray 和 Node Monitor Python 面板。Cloudflared 由用户自行安装和配置。
 
-安装脚本 install-dual.sh 支持三种运行模式：
+## 当前入口与历史版本
+
+根目录保留当前安装入口 `install.sh`、更新脚本 `update.sh` 和面板源码 `panel_dual.py`（文件名使用下划线）。本次整理不改变这些文件的内容。
+
+两份旧安装脚本按完整 Git Blob SHA 归档，内容保持不变，仅供历史查阅，不作为当前安装入口：
+
+| 原路径 | 归档路径（文件名包含完整 Git Blob SHA） |
+| --- | --- |
+| `install-dual.sh` | [`old_version/install-dual-81bbe73b7803b77281a35e9d5679ae0676edbc0d.sh`](old_version/install-dual-81bbe73b7803b77281a35e9d5679ae0676edbc0d.sh) |
+| `install-dual.bak` | [`old_version/install-dual-36c1cc4e34413a46008ca4a1918147cd37bde4aa.bak`](old_version/install-dual-36c1cc4e34413a46008ca4a1918147cd37bde4aa.bak) |
+
+上述哈希是 Git Blob SHA，不是文件 SHA256；现有历史备份没有被覆盖。测试仍优先使用 `install.sh`，其旧文件回退逻辑未修改。`install.sh` 内少量历史提示仍包含 `install-dual.sh`，本次不改程序逻辑；实际运行请使用下面的 `install.sh` 命令。
+
+安装脚本 install.sh 支持三种运行模式：
 
 ```bash
-bash install-dual.sh            正常安装（交互式）
-bash install-dual.sh --check    只读检查当前部署状态，不修改系统
-bash install-dual.sh --recover  在新 Shell 中恢复中断或失败的安装事务
+bash install.sh            正常安装（交互式）
+bash install.sh --check    只读检查当前部署状态，不修改系统
+bash install.sh --recover  在新 Shell 中恢复中断或失败的安装事务
 ```
 
 下面各节的命令与脚本实际实现保持一致。
@@ -129,7 +142,7 @@ systemctl enable cloudflared.service
 
 Cloudflared 如果不是通过 systemd 安装的，需要按照实际运行方式配置开机启动。
 
-## 6. 安装状态检查：`bash install-dual.sh --check`
+## 6. 安装状态检查：`bash install.sh --check`
 
 `--check` 为只读模式，只做检查，不会生成密钥、创建目录、修改权限、重启服务或删除任何文件。
 
@@ -147,7 +160,7 @@ Cloudflared 如果不是通过 systemd 安装的，需要按照实际运行方�
 运行：
 
 ```bash
-bash install-dual.sh --check
+bash install.sh --check
 ```
 
 输出结论为以下之一：
@@ -235,7 +248,7 @@ ls -ltd /var/backups/node-panel-install-* 2>/dev/null | head
 
 ## 8. 安装脚本中途退出后的处理
 
-install-dual.sh 具有安装事务备份和失败回滚机制，行为取决于退出方式：
+install.sh 具有安装事务备份和失败回滚机制，行为取决于退出方式：
 
 - 情况 A：脚本以错误码正常退出（例如某一步骤失败）→ 由 EXIT trap 自动回滚，恢复安装前状态，并写入 ROLLED_BACK。
 - 情况 B：收到 Ctrl+C（SIGINT）或 SIGTERM → 尽力自动回滚（这两个信号可被捕获）。
@@ -247,7 +260,7 @@ install-dual.sh 具有安装事务备份和失败回滚机制，行为取决于�
 检查步骤：
 
 ```bash
-bash install-dual.sh --check
+bash install.sh --check
 
 ls -l /usr/local/etc/xray/config.json
 ls -l /usr/local/bin/xray
@@ -258,15 +271,15 @@ systemctl status xray node-panel --no-pager
 
 如果 `--check` 提示“安装中断，存在未完成事务”或“自动回滚失败，需要人工处理”，请使用下一节的 `--recover` 进行恢复，恢复完成前不要重新安装。
 
-## 9. 中断事务恢复：`bash install-dual.sh --recover`
+## 9. 中断事务恢复：`bash install.sh --recover`
 
 `--recover` 可以在一个全新的 Shell 中独立运行，不依赖上一次安装进程的任何内存状态，它完全根据磁盘上的 state.txt / manifest.tsv / dirs.txt / meta.txt 来恢复。
 
 运行：
 
 ```bash
-bash install-dual.sh --check     # 先检查，确认存在未完成事务
-bash install-dual.sh --recover   # 再恢复
+bash install.sh --check     # 先检查，确认存在未完成事务
+bash install.sh --recover   # 再恢复
 ```
 
 `--recover` 会：
@@ -357,7 +370,7 @@ rm -rf /opt/node-panel
 
 本节记录固定版本验证结果、外部 Box 隔离测试报告、用户提供的 Podman 容器实际检查记录，以及尚未完成的真实环境验收。这里只记录事实和后续计划，不代表所有部署环境均已验收通过。
 
-本节验收对象为 `install.sh`；上文保留的 `install-dual.sh` 使用说明不构成对该文件完成同一轮验收的声明。
+本节验收对象为下述固定 commit 中的 `install.sh`；归档操作不修改该脚本或测试代码，也不扩大原验收范围。
 
 ### 1. 固定版本、静态检查与新机器检查
 
