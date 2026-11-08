@@ -6,12 +6,8 @@ import shutil
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs, urlencode, quote
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from http.cookies import SimpleCookie
 from io import BytesIO
 
-AUTH = Path("/etc/node-panel/auth.json")
-KEY = Path("/etc/node-panel/secret.key")
 XRAY_CONFIG = Path("/usr/local/etc/xray/config.json")
 PANEL_CONFIG = Path("/etc/node-panel/panel-config.json")
 ALLOWED = re.compile(r"(?i)^/(?:usage|u|admin|ad|a)/?$")
@@ -76,9 +72,6 @@ def authorize(coordinator, token):
     return coordinator.auth.validate(token)
 
 
-failures = 0
-blocked_until = 0
-login_lock = __import__("threading").Lock()
 
 # 网络诊断缓存：只存于进程内存，不写入磁盘
 diag_lock = __import__("threading").Lock()

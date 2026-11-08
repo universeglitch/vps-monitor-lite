@@ -548,7 +548,9 @@ class PanelBackend:
         self.c.auth.validate(token)
         try:data=self._configuration()
         except (OSError,AuthError):return []
-        cfg=self.metadata();names=self.preferences(token)['names'];out=[];seen=set()
+        cfg=self.metadata();prefs=self.preferences(token)
+        cfg.update(prefs.get('node_metadata',{}))
+        names=prefs['names'];out=[];seen=set()
         for inbound in data['inbounds']:
             if not isinstance(inbound,dict) or inbound.get('protocol')!='vless':continue
             stream=inbound.get('streamSettings') or {};net=stream.get('network');security=stream.get('security','none')
@@ -642,6 +644,7 @@ class PanelBackend:
         try:data=self._configuration();inbounds=data['inbounds']
         except (OSError,AuthError):inbounds=[]
         kinds={'ws':False,'xhttp':False,'reality':False}
+        valid_kinds={n['type'] for n in self.nodes(token)}
         for i in inbounds:
             if not isinstance(i,dict):continue
             ss=i.get('streamSettings') or {}
@@ -653,9 +656,9 @@ class PanelBackend:
         disabled_raw=self.store.read('disabled-inbounds.json',missing=True)
         disabled=loads(disabled_raw) if disabled_raw else {}
         for kind,label in [('ws','WS + TLS'),('xhttp','XHTTP'),('reality','REALITY (RAW/TCP)')]:
-            unit=state['services'].get('xray',{});configured=kinds[kind]
+            unit=state['services'].get('xray',{});configured=kinds[kind] and kind in valid_kinds
             saved={'ws':'vps-monitor-ws','xhttp':'vps-monitor-xhttp','reality':'vps-monitor-reality'}[kind] in disabled
-            st='未安装' if not unit.get('installed') else '已停止' if saved and not configured else '已安装但未配置' if not configured else '正在运行' if unit.get('active') else '已配置但未启动'
+            st='未安装' if not unit.get('installed') else '已停止' if saved and not configured else '配置错误' if kinds[kind] and not configured else '已安装但未配置' if not configured else '正在运行' if unit.get('active') else '已配置但未启动'
             mods.append({'id':kind,'name':label,'state':st,'active':bool(configured and unit.get('active')),'visible':bool((configured or saved) and unit.get('installed')),'configured':configured,'installed':bool(unit.get('installed'))})
         cloud=state['services'].get('cloudflared',{});configured=False
         if self.c.discovery and self.c.discovery.cloud_config:
@@ -667,7 +670,7 @@ class PanelBackend:
 
     def guide(self, token):
         self.c.auth.validate(token)
-        cfg=self.metadata();ws=cfg.get('ws') or {}
+        cfg=self.metadata();cfg.update(self.preferences(token).get('node_metadata',{}));ws=cfg.get('ws') or {}
         return {'title':'Cloudflare Tunnel 需要你自行配置',
                 'ws_rule':str(ws.get('host') or '$WS_HOST')+' -> HTTP -> 127.0.0.1:'+str(ws.get('listen_port') or '$WS_PORT'),
                 'panel_rule':'面板域名 -> HTTP -> 127.0.0.1:'+str(self.port or '$PANEL_PORT'),
@@ -783,6 +786,9 @@ class PanelBackend:
                            {'name':'sni','label':'serverName','required':True,'help':'与你的 target 相容的域名'},
                            {'name':'private_key','label':'REALITY 私钥','required':True,'secret':True,'help':'当前 Xray 支持的 X25519 私钥，仅用于候选配置'},
                            {'name':'short_id','label':'Short ID','required':True,'help':'偶数长度十六进制，最多16字符'}])
+        fields.extend([{'name':'public_host','label':'客户端连接地址','required':True,'help':'真实公网域名/IP，不从监听地址推断'},
+                       {'name':'public_port','label':'客户端连接端口','required':True,'help':'真实入口端口，不从源站端口推断'}])
+        if kind=='reality':fields.append({'name':'public_key','label':'REALITY 公钥','required':True,'help':'必须与填写私钥匹配，客户端使用；不会猜测公钥'})
         for f in fields:f.setdefault('value','')
         return {'title':{'ws':'VLESS + WebSocket','xhttp':'VLESS + XHTTP','reality':'VLESS + REALITY（RAW/TCP）'}[kind],
                 'description':'不支持 WS + REALITY 组合。参数无自动猜测；必须在当前 Xray 版本自测成功后才可确认应用。现有非本项目入站不会接管。','fields':fields}
@@ -822,8 +828,31 @@ class PanelBackend:
         return {'tag':tag,'listen':listen,'port':port,'protocol':'vless','settings':{'clients':[{'id':uid}],'decryption':'none'},'streamSettings':stream}
 
     def preview(self, token, kind, values):
+        import re,ipaddress
         inbound=self._inbound(kind,values)
-        return self.preview_mapping(token,{inbound['tag']:inbound})
+        host=values.get('public_host','')
+        try:ipaddress.ip_address(host)
+        except ValueError:
+            if not re.fullmatch(r'[A-Za-z0-9.-]{1,253}',host):raise AuthError('真实客户端连接域名/IP 必填')
+        try:port=int(values.get('public_port',''))
+        except (ValueError,TypeError):raise AuthError('客户端连接端口必填') from None
+        if not 1<=port<=65535:raise AuthError('客户端端口范围错误')
+        metadata={'host':host,'port':port,'listen_port':inbound['port']}
+        if kind=='reality':
+            if not re.fullmatch(r'[A-Za-z0-9_-]{43}',values.get('public_key','')):raise AuthError('REALITY 公钥格式错误')
+            # Derive the public key locally using already-required cryptography,
+            # never spawn xray x25519 with private key argv.
+            import base64
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+            raw=base64.urlsafe_b64decode(values['private_key']+'=')
+            derived=X25519PrivateKey.from_private_bytes(raw).public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+            expected=base64.urlsafe_b64encode(derived).decode().rstrip('=')
+            if expected!=values['public_key']:raise AuthError('REALITY 公私钥不匹配')
+            metadata.update(address=host,public_key=expected)
+        preview=self.preview_mapping(token,{inbound['tag']:inbound})
+        with self.permit_lock:self.permits[preview['confirmation']]['node_metadata']={kind:metadata}
+        return preview
 
     def preview_mapping(self, token, replacements):
         from auth import dumps
@@ -891,6 +920,12 @@ class PanelBackend:
         if x.fingerprint(x._read()[0])!=r['hash']:raise AuthError('config changed after preview')
         permit=x.confirm(token)
         result=x.configure(token,permit['confirmation'],r['replacements'])
+        if hasattr(self.c.active,'desired'):
+            with self.c.active.lock:self.c.active.desired['xray']=True
+        if 'node_metadata' in r:
+            from auth import dumps
+            prefs=self.preferences(token);prefs.setdefault('node_metadata',{}).update(r['node_metadata'])
+            self.store.write('panel-preferences.json',dumps(prefs))
         if 'disabled_after' in r:
             from auth import dumps
             self.store.write('disabled-inbounds.json',dumps(r['disabled_after']))
