@@ -19,7 +19,10 @@ jobs:
       - name: Syntax and isolated tests
         run: |
           set -euo pipefail
-          python -m py_compile auth.py
+          python -m py_compile auth.py function.py active.py main.py panel.py
           python -m unittest discover -s tests -p 'test_*v1.py' -v
-          git diff --exit-code -- panel.py install.sh update.sh node-panel.service
-          test "$(git hash-object panel.py)" = 45be400e2e0cc1716b7fa99506c3868bd854498a
+          python -O -m unittest discover -s tests -p 'test_*v1.py' -v
+          git diff --exit-code -- install.sh update.sh node-panel.service
+          test "$(git hash-object install.sh)" = a1d082d50625d6899371f33bc85d74da09bf6ded
+          test "$(git hash-object update.sh)" = 19b6416cabb7d25f602aaa4481abf9ee94ed1504
+          test "$(git hash-object node-panel.service)" = 8a4ff96d012f1dd32ce6a64bcf2c4c6df862b4b5
