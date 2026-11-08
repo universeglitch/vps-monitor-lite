@@ -350,3 +350,220 @@ rm -rf /opt/node-panel
 - 不含 Cloudflare Tunnel 凭据
 
 因此已有登录凭据与会话无法从本仓库恢复；这些文件由部署时生成，请自行妥善保管。
+
+## 验收记录与后续待验收项目
+
+### 记录范围与证据来源
+
+本节记录固定版本验证结果、外部 Box 隔离测试报告、用户提供的 Podman 容器实际检查记录，以及尚未完成的真实环境验收。这里只记录事实和后续计划，不代表所有部署环境均已验收通过。
+
+本节验收对象为 `install.sh`；上文保留的 `install-dual.sh` 使用说明不构成对该文件完成同一轮验收的声明。
+
+### 1. 固定版本、静态检查与新机器检查
+
+目标 commit：
+
+```text
+475f019c04249170cf421e968d6219e2e1292933
+```
+
+`install.sh` SHA256：
+
+```text
+6e9681bed20d692f778b7ec0841fb7ebac96501a213dcf0ea7a0d13892531a45
+```
+
+以下三个文件均已通过逐文件 `bash -n` 语法检查：
+
+- `install.sh`
+- `tests/run-recovery-tests.sh`
+- `tests/recovery-boundary-tests.sh`
+
+检查命令：
+
+```bash
+for f in install.sh tests/run-recovery-tests.sh tests/recovery-boundary-tests.sh; do
+  echo "检查：$f"
+  bash -n "$f" || exit 1
+done
+```
+
+完整输出为：
+
+```text
+检查：install.sh
+检查：tests/run-recovery-tests.sh
+检查：tests/recovery-boundary-tests.sh
+```
+
+语法检查退出码为 `0`。这是静态语法检查，不等于真实 VPS 安装或恢复验收。
+
+根据用户提供的新机器实际检查记录，已完成以下检查；环境细节见下方 Podman 记录：
+
+- `--help` 正常。
+- `--check` 正常，能识别 Debian 13 x86_64 和 systemd。
+- 能识别 Xray、面板及 Cloudflared 均未安装。
+- 能扫描事务目录并报告无未完成事务。
+- 最终判断为“未安装，可进行全新安装”。
+- 检查时没有发现事务备份目录。
+- 已核对代码路径：`--check` 在正常安装锁获取之前执行检查并直接退出。
+
+以上只记录检查结果和代码路径核对结论，**不表示整个系统绝对零写入已经得到证明**。
+
+### 2. 外部 Box 隔离测试报告
+
+报告固定在上述目标 HEAD 执行，统计如下：
+
+| 环境 | PASS 断言 | FAIL 断言 | SKIP |
+| --- | ---: | ---: | ---: |
+| 普通用户 | 660 | 0 | 2 |
+| root mock | 666 | 0 | 0 |
+
+普通用户的两个 SKIP 为需要 root 权限的测试（T0、T4）；root mock 运行没有 SKIP。**660 和 666 是 PASS 断言数量，不是测试用例数量。**
+
+T33–T43 边界测试在普通用户和 root 两种身份下均执行，报告覆盖：
+
+- 服务缺失时的状态恢复和安装前服务状态保护。
+- 文件恢复失败时阻断服务启动。
+- daemon-reload 失败时阻断服务启动。
+- enabled 状态恢复失败时阻断服务启动。
+- `ROLLBACK_IN_PROGRESS` 事务状态写入失败保护。
+- `meta.txt`、`state.txt` 元数据和服务状态字段损坏保护。
+- `manifest.tsv`、`hashes.tsv` 的格式、末行截断及换行边界。
+- Xray 启动成功但 Panel 启动失败时，整体返回失败而不误报回滚成功。
+- 拒绝 `SERVICE` journal action。
+- 同一路径多条合法 `post` 记录仍以最后一条为准。
+
+**来源与限制：这些数据以外部 Box 环境提供的隔离测试报告归档，使用临时目录和 mock，不代表真实 systemd、真实账户管理或物理断电测试。本次 README 更新中，本助手没有独立取得 Box 原始日志，不能将上述外部报告表述为本次更新亲自复现的结果。**
+
+外部报告给出的日志位置为 Box 内的 `/workspace/validation/final-evidence.J9pPIS/`，包括 `user-full.plain.log`、`root-full.plain.log`、实际命令及版本核对记录。这些是外部环境路径，不是仓库附件或保证长期可访问的证据存档。
+
+### 3. Podman 容器实际检查记录
+
+日期：**2026-11-08**。以下为用户提供的容器实际检查记录；本次文档更新未另行复现该容器检查。
+
+| 检查项 | 实际记录 |
+| --- | --- |
+| `systemd-detect-virt` | `podman` |
+| PID 1 | `systemd` |
+| `systemctl is-system-running` | `running` |
+| 运行服务 | SSH、systemd-journald |
+| 根文件系统 | `overlay` |
+| cgroup `memory.max` | `134217728` |
+| cgroup `memory.swap.max` | `134217728` |
+| 内存限制 | 128 MiB |
+| Debian | 13.7 |
+| 内核 | `6.12.41+deb13-amd64` |
+
+该容器已完成：
+
+- `--help`。
+- `--check`。
+- 脚本 SHA256 核对。
+
+**没有执行正式安装。** 虽然容器内部运行 systemd，但 Podman 容器不等同完整 VM 或独立 VPS；`overlay` 文件系统和 128 MiB 内存限制也使其不能代表真实安装、磁盘持久化及异常断电验收。
+
+### 4. 后续待验收清单
+
+以下项目全部为**未验收**。不得使用 mock 通过结果替代真实环境验收，也不能根据上面的检查输出推断这些项目已经通过。
+
+#### A. 完整安装——未验收
+
+在完整 Debian 13 VM 或独立 VPS 上验证：
+
+- [ ] 全新安装。
+- [ ] Xray 实际安装及配置测试。
+- [ ] Xray systemd 服务的 active/enabled 状态。
+- [ ] node-panel 实际启动。
+- [ ] `/usage` 返回 HTTP 200。
+- [ ] WS 和 REALITY（启用时）端口监听。
+- [ ] `auth.json` 内容结构、非空、属主和 `600` 权限；`secret.key` 的预期密钥格式/长度、非空、属主和 `600` 权限。
+- [ ] 事务最终状态为 `COMMITTED`。
+- [ ] 安装完成后重新运行 `--check`，记录实际结果。
+
+#### B. 真实 systemd 回滚——未验收
+
+在具有可恢复快照的环境中验证：
+
+- [ ] 真实 EXIT trap 回滚。
+- [ ] 文件和目录恢复。
+- [ ] Xray 用户和组恢复。
+- [ ] 服务 active/enabled 状态恢复。
+- [ ] stop、disable、daemon-reload、start 等操作失败时，危险恢复步骤是否被阻断。
+- [ ] Xray 启动成功但 Panel 启动失败时的真实回滚。
+
+#### C. SIGINT / SIGTERM / SIGKILL 恢复——未验收
+
+在可回滚快照环境中分别测试：
+
+- [ ] SIGINT。
+- [ ] SIGTERM。
+- [ ] 不同安装阶段 SIGKILL。
+- [ ] 新 Shell 执行 `--recover`。
+- [ ] 恢复过程中再次 SIGKILL。
+- [ ] 恢复中断后能否安全断点续跑。
+- [ ] 核对实际结果对应的最终状态 `ROLLED_BACK` 或 `ROLLBACK_FAILED`，并核对文件、账户和服务结果。
+
+不能只根据进程退出码判断恢复成功。
+
+#### D. 真实磁盘持久化和异常重启——未验收
+
+在支持快照和控制台恢复的测试 VM 中验证：
+
+- [ ] 事务状态持久化。
+- [ ] journal 持久化。
+- [ ] 文件指纹持久化。
+- [ ] fsync 实际行为。
+- [ ] 受控重启或异常断电后，`--check` 能否发现未完成事务。
+- [ ] `--recover` 能否安全恢复并避免覆盖外部修改。
+
+**mock 的 fsync 替身不构成真实磁盘持久化证据。**
+
+#### E. Cloudflared 共存保护——未验收
+
+当前测试容器没有 Cloudflared，因此此项尚未验收。后续在测试 VM 中依次执行：
+
+1. 预先安装并运行 Cloudflared。
+2. 记录配置、进程、服务状态和文件指纹。
+3. 执行正常安装。
+4. 执行失败回滚。
+5. 执行恢复。
+6. 检查 Cloudflared 配置、进程、服务状态和相关文件是否完全未被修改、停止、重启或删除。
+
+- [ ] 完成上述全部步骤，保存前后对照和日志。
+
+#### F. 发行版与资源边界——未验收
+
+- [ ] 在完整 Debian 13 环境重新验收。
+- [ ] 评估低内存机器的安装行为。
+- [ ] 记录内存峰值、OOM 和失败回滚情况。
+- [ ] 补充 ShellCheck 静态检查；当前尚未执行。
+
+### 5. PANEL_URL 的版本固定问题
+
+当前 `install.sh` 的 `PANEL_URL` 指向 GitHub 的 `main` 分支，而不是固定提交。本次通过 GitHub 文件元数据和目标提交核对，目标提交与当时 `main`（`362266e46b06417108195c0569447e5431289861`）中的 `panel_dual.py` Blob SHA 相同：
+
+```text
+45be400e2e0cc1716b7fa99506c3868bd854498a
+```
+
+该一致性是当时文件内容的核对结果，不保证之后的 `main` 仍然相同。安装时仍依赖可变的 `main` 引用；如果要求完全可复现，正式验收前应将面板下载地址固定到经过核对的 commit。
+
+修改 `PANEL_URL` 属于后续代码任务；本次 README 更新没有修改 `install.sh`。
+
+### 6. 后续真实验收记录规范
+
+每次真实验收至少记录：
+
+- 日期。
+- 机器类型（完整 VM / 独立 VPS / 容器）。
+- 发行版和版本。
+- 内存限制。
+- 目标 commit SHA。
+- 脚本 SHA256。
+- 执行命令。
+- 实际输出和完整日志。
+- 事务最终状态。
+- 快照编号。
+
+未执行项目保持“未验收”；失败项目必须记录原因和日志，不允许用 mock 通过结果替代真实环境验收。
