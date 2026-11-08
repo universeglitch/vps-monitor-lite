@@ -342,23 +342,36 @@ class Auth:
     @staticmethod
     def check_state(s):
         try:
-            assert s['format'] == 1
-            assert type(s['epoch']) is int and 1 <= s['epoch'] < 2**63
-            assert type(s['revision']) is int and s['revision'] >= 1
-            assert type(s['version']) is int and s['version'] >= 1
-            assert isinstance(s['apis'], dict) and len(s['apis']) <= MAX_APIS
-            assert re.fullmatch('[0-9a-f]{64}', s['recovery'])
+            if not (s['format'] == 1):
+                raise Corrupt("invalid state or backup field")
+            if not (type(s['epoch']) is int and 1 <= s['epoch'] < 2**63):
+                raise Corrupt("invalid state or backup field")
+            if not (type(s['revision']) is int and s['revision'] >= 1):
+                raise Corrupt("invalid state or backup field")
+            if not (type(s['version']) is int and s['version'] >= 1):
+                raise Corrupt("invalid state or backup field")
+            if not (isinstance(s['apis'], dict) and len(s['apis']) <= MAX_APIS):
+                raise Corrupt("invalid state or backup field")
+            if not (re.fullmatch('[0-9a-f]{64}', s['recovery'])):
+                raise Corrupt("invalid state or backup field")
             validate_phc(s['password'])
             for ident, rec in s['apis'].items():
-                assert IDENT.fullmatch(ident)
-                assert isinstance(rec['name'], str) and 1 <= len(rec['name']) <= 80
-                assert IDENT.fullmatch(rec['object'])
-                assert re.fullmatch('[0-9a-f]{64}', rec['verify'])
+                if not (IDENT.fullmatch(ident)):
+                    raise Corrupt("invalid state or backup field")
+                if not (isinstance(rec['name'], str) and 1 <= len(rec['name']) <= 80):
+                    raise Corrupt("invalid state or backup field")
+                if not (IDENT.fullmatch(rec['object'])):
+                    raise Corrupt("invalid state or backup field")
+                if not (re.fullmatch('[0-9a-f]{64}', rec['verify'])):
+                    raise Corrupt("invalid state or backup field")
         except (KeyError, TypeError, AssertionError) as exc:
             raise Corrupt('invalid authority state') from exc
 
     def lmk(self):
-        key = self.store.read('master.key', 'master')
+        state_raw = self.store.read('auth.json', missing=True)
+        name = loads(state_raw).get('master_object', 'master.key') if state_raw else 'master.key'
+        self.store.name(name)
+        key = self.store.read(name, 'master')
         if len(key) != 32:
             raise Corrupt('invalid LMK')
         return key
@@ -402,18 +415,22 @@ class Auth:
     @staticmethod
     def check_payload(p):
         try:
-            assert p['format'] == 1
+            if not (p['format'] == 1):
+                raise Corrupt("invalid state or backup field")
             s = p['state']; Auth.check_state(s)
             master = unb64(p['master'], 32)
             kek = open_seal(master, s['kek'], ('kek/' + str(s['version'])).encode())
-            assert len(kek) == 32
-            assert set(p['objects']) == {r['object'] for r in s['apis'].values()}
+            if not (len(kek) == 32):
+                raise Corrupt("invalid state or backup field")
+            if not (set(p['objects']) == {r['object'] for r in s['apis'].values()}):
+                raise Corrupt("invalid state or backup field")
             for ident, rec in s['apis'].items():
                 aad = ('api/' + ident + '/' + str(rec['version'])).encode()
                 obj = p['objects'][rec['object']]
                 dek = open_seal(kek, obj['dek'], aad + b'/dek')
                 raw = open_seal(dek, obj['key'], aad)
-                assert hmac.compare_digest(hashlib.sha256(raw).hexdigest(), rec['verify'])
+                if not (hmac.compare_digest(hashlib.sha256(raw).hexdigest(), rec['verify'])):
+                    raise Corrupt("invalid state or backup field")
         except (KeyError, TypeError, AssertionError, ValueError) as exc:
             raise Corrupt('invalid backup payload') from exc
 
@@ -422,11 +439,18 @@ class Auth:
         key = hmac.digest(master, b'local-backup-key/v1', 'sha256')
         payload = self.payload(s)
         self.check_payload(payload)
-        raw = dumps(seal(key, dumps(payload), b'backup/v1'), MAX_ENVELOPE)
+        envelope = seal(key, dumps(payload), b'backup/v1')
+        envelope['master_object'] = s.get('master_object', 'master.key')
+        raw = dumps(envelope, MAX_ENVELOPE)
         self.check_payload(loads(open_seal(key, loads(raw, MAX_ENVELOPE), b'backup/v1')))
         old = self.store.read('auth_backup_latest.enc', 'backup', missing=True)
         if old is not None:
-            self.check_payload(loads(open_seal(key, loads(old, MAX_ENVELOPE), b'backup/v1')))
+            old_env = loads(old, MAX_ENVELOPE)
+            old_name = old_env.get('master_object', 'master.key')
+            self.store.name(old_name)
+            old_master = self.store.read(old_name, 'master')
+            old_key = hmac.digest(old_master, b'local-backup-key/v1', 'sha256')
+            self.check_payload(loads(open_seal(old_key, old_env, b'backup/v1')))
             self.store.write('auth_backup_previous.enc', old, 'backup')
         self.store.write('auth_backup_latest.enc', raw, 'backup')
         self.store.write('backup_metadata.json', dumps({'revision': s['revision'], 'format': 1}), 'backup')
@@ -578,8 +602,12 @@ class Auth:
                 s = self.state(); self.session(s, token)
                 payload = dumps(self.payload(s))
             salt = secrets.token_bytes(16)
-            with HASH_GATE:
+            if not HASH_GATE.acquire(timeout=2):
+                raise Busy('Argon2 worker busy')
+            try:
                 key = hash_secret_raw(independent_password.encode(), salt, 3, 8192, 1, 32, Type.ID, 19)
+            finally:
+                HASH_GATE.release()
             header = {'format': 1, 'kdf': 'argon2id-v19', 'm': 8192, 't': 3, 'p': 1, 'salt': b64(salt)}
             return dumps({'header': header, 'sealed': seal(key, payload, dumps(header))}, MAX_ENVELOPE)
 
@@ -592,8 +620,12 @@ class Auth:
             if set(h) != {'format','kdf','m','t','p','salt'} or (h['format'],h['kdf'],h['m'],h['t'],h['p']) != (1,'argon2id-v19',8192,3,1):
                 raise Corrupt('unsupported backup KDF')
             salt = unb64(h['salt'], 16)
-            with HASH_GATE:
+            if not HASH_GATE.acquire(timeout=2):
+                raise Busy('Argon2 worker busy')
+            try:
                 key = hash_secret_raw(independent_password.encode(), salt, 3, 8192, 1, 32, Type.ID, 19)
+            finally:
+                HASH_GATE.release()
             payload = loads(open_seal(key, envelope['sealed'], dumps(h)))
             self.check_payload(payload)
             with self.store.transaction():
@@ -603,6 +635,7 @@ class Auth:
                 s = payload['state']
                 old_kek = open_seal(unb64(payload['master'], 32), s['kek'], ('kek/' + str(s['version'])).encode())
                 # Import into the existing local LMK; only auth.json switches authority.
+                s['master_object'] = current.get('master_object', 'master.key')
                 s['kek'] = seal(self.lmk(), old_kek, ('kek/' + str(s['version'])).encode())
                 s['epoch'] = max(s['epoch'], current['epoch']) + 1
                 s['revision'] = current['revision']
@@ -613,3 +646,118 @@ class Auth:
                         raise Busy('object collision; retry')
                     self.store.write(name, dumps(payload['objects'][old_obj]), 'api')
                 self.commit(s)
+
+    def rotate_keys(self, token):
+        """Rotate LMK/KEK/DEKs atomically through auth.json authority.
+
+        Old immutable files are deliberately retained until backup/transaction
+        reference validation allows collect_objects(). No online secret logging.
+        """
+        with self.cost('key-rotation'):
+            with self.store.transaction():
+                s = self.state(); self.session(s, token)
+                old = self.payload(s); self.check_payload(old)
+                old_kek = self.kek(s)
+                master, kek = secrets.token_bytes(32), secrets.token_bytes(32)
+                version = s['version'] + 1
+                master_name = 'master-' + secrets.token_hex(16) + '.key'
+                if self.store.read(master_name, 'master', True) is not None:
+                    raise Busy('master identifier collision')
+                self.store.write(master_name, master, 'master')
+                for ident, rec in s['apis'].items():
+                    aad = ('api/' + ident + '/' + str(rec['version'])).encode()
+                    obj = old['objects'][rec['object']]
+                    raw = open_seal(open_seal(old_kek, obj['dek'], aad + b'/dek'), obj['key'], aad)
+                    new_aad = ('api/' + ident + '/' + str(version)).encode()
+                    dek = secrets.token_bytes(32); objid = secrets.token_hex(16)
+                    name = 'API_' + objid + '.json'
+                    if self.store.read(name, 'api', True) is not None:
+                        raise Busy('object identifier collision')
+                    self.store.write(name, dumps({'dek': seal(kek, dek, new_aad + b'/dek'),
+                                                  'key': seal(dek, raw, new_aad)}), 'api')
+                    rec.update(object=objid, version=version)
+                s.update(master_object=master_name, version=version,
+                         kek=seal(master, kek, ('kek/' + str(version)).encode()))
+                self.commit(s)
+                return version
+
+    def local_backup(self, token):
+        with self.cost('backup'):
+            with self.store.transaction():
+                s = self.state(); self.session(s, token)
+                self.backup(s)
+                return s['revision']
+
+    def restore_local(self, token, slot):
+        if slot not in ('latest', 'previous'):
+            raise AuthError('invalid backup slot')
+        with self.cost('restore'):
+            with self.store.transaction():
+                current = self.state(); self.session(current, token)
+                envelope = loads(self.store.read('auth_backup_' + slot + '.enc', 'backup'), MAX_ENVELOPE)
+                name = envelope.get('master_object', 'master.key'); self.store.name(name)
+                master = self.store.read(name, 'master')
+                key = hmac.digest(master, b'local-backup-key/v1', 'sha256')
+                payload = loads(open_seal(key, envelope, b'backup/v1'))
+                self.check_payload(payload)
+                self._import_payload(current, payload)
+
+    def _import_payload(self, current, payload):
+        """Caller owns transaction and resource gate; input already authenticated."""
+        s = payload['state']
+        kek = open_seal(unb64(payload['master'], 32), s['kek'], ('kek/' + str(s['version'])).encode())
+        s['master_object'] = current.get('master_object', 'master.key')
+        s['kek'] = seal(self.lmk(), kek, ('kek/' + str(s['version'])).encode())
+        s['epoch'] = max(s['epoch'], current['epoch']) + 1
+        s['revision'] = current['revision']
+        for rec in s['apis'].values():
+            old_obj = rec['object']; rec['object'] = secrets.token_hex(16)
+            name = 'API_' + rec['object'] + '.json'
+            if self.store.read(name, 'api', True) is not None:
+                raise Busy('object identifier collision')
+            self.store.write(name, dumps(payload['objects'][old_obj]), 'api')
+        self.commit(s)
+
+    def collect_objects(self, token):
+        """Only immutable unreferenced objects; fail closed on invalid backups.
+
+        Serialized with all auth operations, so exports/imports and rotations
+        cannot run concurrently. External exports contain their own key material.
+        Unknown temporary/transaction records cause refusal, never speculative GC.
+        """
+        with self.cost('key-cleanup'):
+            with self.store.transaction():
+                s = self.state(); self.session(s, token)
+                roots = [s]
+                masters = {s.get('master_object', 'master.key')}
+                for slot in ('latest', 'previous'):
+                    raw = self.store.read('auth_backup_' + slot + '.enc', 'backup', True)
+                    if raw is None:
+                        continue
+                    env = loads(raw, MAX_ENVELOPE)
+                    name = env.get('master_object', 'master.key'); self.store.name(name)
+                    master = self.store.read(name, 'master'); masters.add(name)
+                    key = hmac.digest(master, b'local-backup-key/v1', 'sha256')
+                    payload = loads(open_seal(key, env, b'backup/v1'))
+                    self.check_payload(payload); roots.append(payload['state'])
+                objects = {r['object'] for state in roots for r in state['apis'].values()}
+                with self.store.directory('') as rootfd:
+                    names = os.listdir(rootfd)
+                    if any(n.startswith('.tmp-') or n.startswith('transaction') for n in names):
+                        raise Busy('incomplete storage operation; cleanup refused')
+                removed = 0
+                for area in ('api', 'master'):
+                    with self.store.directory(area) as fd:
+                        for name in os.listdir(fd):
+                            if name.startswith('.tmp-'):
+                                raise Busy('incomplete object write; cleanup refused')
+                            if area == 'api':
+                                match = re.fullmatch(r'API_([0-9a-f]{32})\.json', name)
+                                delete = match is not None and match[1] not in objects
+                            else:
+                                delete = (name == 'master.key' or re.fullmatch(r'master-[0-9a-f]{32}\.key', name)) and name not in masters
+                            if delete:
+                                self.store.read(name, area)
+                                os.unlink(name, dir_fd=fd); removed += 1
+                        os.fsync(fd)
+                return removed

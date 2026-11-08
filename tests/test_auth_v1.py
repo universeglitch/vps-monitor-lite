@@ -155,3 +155,22 @@ class AuthTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class RotationTests(AuthTests):
+    def test_rotation_preserves_api_and_backups(self):
+        token = self.login(); api = self.a.create_api(token, 'rotate')
+        before = self.a.state()['version']
+        self.assertEqual(self.a.rotate_keys(token), before + 1)
+        self.assertEqual(self.a.read_api(token, api['id']), api['key'])
+        self.a.restore_local(token, 'previous')
+        with self.assertRaises(AuthError): self.a.validate(token)
+        token = self.login()
+        self.assertEqual(self.a.read_api(token, api['id']), api['key'])
+
+    def test_gc_keeps_previous_backup_keys(self):
+        token = self.login(); api = self.a.create_api(token, 'gc')
+        self.a.rotate_keys(token)
+        self.a.collect_objects(token)
+        self.a.restore_local(token, 'previous')
+        token = self.login()
+        self.assertEqual(self.a.read_api(token, api['id']), api['key'])

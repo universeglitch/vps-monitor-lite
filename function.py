@@ -139,6 +139,8 @@ class Coordinator:
         epoch = self.auth.validate(token)
         if self.auth.validate(token) != epoch:
             raise AuthError('authentication changed')
+        if enabled is True:
+            raise AuthError('start requires configuration readiness validation')
         return self.active.set_service(service, enabled)
 
     def api(self, token, action, **args):
