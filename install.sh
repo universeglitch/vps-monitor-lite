@@ -164,6 +164,29 @@ state_status_ok(){
   return 1
 }
 
+# 持久化记录必须以换行结束；不能让 read 静默丢掉截断的末行。
+file_has_final_newline(){
+  local f="$1" last_byte
+  [[ -f "$f" && -s "$f" ]] || return 1
+  last_byte="$(tail -c 1 -- "$f" | od -An -tu1)" || return 1
+  [[ "$last_byte" =~ ^[[:space:]]*10[[:space:]]*$ ]]
+}
+
+# 安全决策使用的布尔字段必须恰好出现一次，且只能为字面量 0 / 1。
+# 不使用 state_get 的“首条匹配”来掩盖重复字段，也不把缺失/空值当成 0。
+verify_binary_fields(){
+  local f="$1" k count v
+  shift
+  file_has_final_newline "$f" || return 1
+  for k in "$@"; do
+    count="$(grep -c "^${k}=" "$f")" || return 1
+    [[ "$count" == "1" ]] || return 1
+    v="$(state_get "$f" "$k")"
+    [[ "$v" == "0" || "$v" == "1" ]] || return 1
+  done
+  return 0
+}
+
 # 把文件/目录刷入磁盘，降低断电丢失状态/指纹/恢复日志的风险。
 # 关键持久化操作失败必须被调用方感知，因此这里绝不返回假成功：
 #   - 成功持久化返回 0；
@@ -182,17 +205,19 @@ fsync_path(){
   return 1
 }
 
-# 校验状态文件：字段齐全（manifest_complete / hashes_complete 均为合法值），可选校验 status / current_stage
+# 校验状态文件：字段唯一且非空，服务状态及完整性标记只能为 0 / 1。
 state_verify_fields(){
-  local f="$1" want_status="${2:-}" want_stage="${3:-}" k v
+  local f="$1" want_status="${2:-}" want_stage="${3:-}" k count
   [[ -f "$f" ]] || return 1
   for k in "${STATE_KEYS[@]}"; do
-    grep -q "^${k}=" "$f" || return 1
+    count="$(grep -c "^${k}=" "$f")" || return 1
+    [[ "$count" == "1" && -n "$(state_get "$f" "$k")" ]] || return 1
   done
-  for k in manifest_complete hashes_complete; do
-    v="$(state_get "$f" "$k")"
-    [[ "$v" == "0" || "$v" == "1" ]] || return 1
-  done
+  verify_binary_fields "$f" \
+    xray_was_active xray_was_enabled \
+    node_panel_was_active node_panel_was_enabled \
+    manifest_complete hashes_complete || return 1
+  state_status_ok "$(state_get "$f" status)" || return 1
   [[ -z "$want_status" || "$(state_get "$f" status)" == "$want_status" ]] || return 1
   [[ -z "$want_stage" || "$(state_get "$f" current_stage)" == "$want_stage" ]] || return 1
   return 0
@@ -481,7 +506,7 @@ journal_set(){
     *) red "恢复日志写入失败：非法状态取值：${state:-空}"; return 1 ;;
   esac
   case "$action" in
-    RESTORE|REMOVE|SERVICE) ;;
+    RESTORE|REMOVE) ;;
     *) red "恢复日志写入失败：非法动作取值：${action:-空}"; return 1 ;;
   esac
 
@@ -839,8 +864,12 @@ restore_transaction(){
   local meta="$dir/$META_FILE"
   local failed=0
 
-  if [[ ! -f "$manifest" ]]; then
-    red "缺少事务清单，无法自动恢复：$manifest"
+  # 自动回滚与独立恢复共享同一前置门禁，不能只依赖 recover_mode 的校验。
+  # 元数据/状态/清单/指纹全部通过之前，不得操作服务、恢复文件或删除账户。
+  local issues
+  if ! issues="$(verify_transaction "$dir")"; then
+    red "恢复中止：事务元数据或备份校验失败："
+    echo "$issues"
     return 1
   fi
 
@@ -1113,7 +1142,7 @@ restore_transaction(){
   fi
 
   # 清理本次创建的 Xray 用户（仅当安装前不存在）
-  if [[ "$xu_existed" != "1" ]] && getent passwd xray >/dev/null 2>&1; then
+  if [[ "$xu_existed" == "0" ]] && getent passwd xray >/dev/null 2>&1; then
     local xray_pids=""
     if ! xray_pids="$(ps -u xray -o pid= 2>/dev/null)"; then
       red "恢复失败：无法检查 Xray 用户进程，不能安全删除账户，相关服务保持停止。"
@@ -1129,7 +1158,7 @@ restore_transaction(){
   fi
 
   # 仅在 Xray 用户已不存在时删除同名用户组
-  if [[ "$xg_existed" != "1" ]] &&
+  if [[ "$xg_existed" == "0" ]] &&
      ! getent passwd xray >/dev/null 2>&1 &&
      getent group xray >/dev/null 2>&1; then
     if ! groupdel xray; then
@@ -1215,6 +1244,13 @@ restore_transaction(){
 rollback_all(){
   [[ -n "${BACKUP_DIR:-}" && -d "${BACKUP_DIR:-}" ]] || return 1
   yellow "正在回滚本次安装……"
+  # 先验证原始磁盘记录，避免 state_write 覆盖损坏字段后掩盖异常。
+  local issues
+  if ! issues="$(verify_transaction "$BACKUP_DIR")"; then
+    red "回滚中止：事务元数据或备份校验失败，未执行恢复动作："
+    echo "$issues"
+    return 1
+  fi
   if ! state_write "ROLLBACK_IN_PROGRESS" "rollback"; then
     red "无法持久化 ROLLBACK_IN_PROGRESS 状态，已中止自动回滚文件操作。"
     red "请保留备份目录并在确认状态后使用 --recover：$BACKUP_DIR"
@@ -1357,7 +1393,7 @@ detect_existing(){
   (( xray_conf ))       && found+=("Xray 配置 $XRAY_CONFIG")
   (( xray_unit ))       && found+=("systemd 单元 $XRAY_SERVICE")
   (( panel_unit ))      && found+=("systemd 单元 $PANEL_SERVICE")
-  (( modules ))         && found+=("Xray systemd drop-in 目录")
+  (( modules ))        && found+=("Xray systemd drop-in 目录")
   [[ -n "$xray_bin" ]]  && found+=("Xray 程序 $xray_bin")
   (( xray_user ))       && found+=("Xray 用户")
   (( xray_group ))      && found+=("Xray 用户组")
@@ -1613,7 +1649,17 @@ verify_transaction(){
   local manifest="$dir/$MANIFEST_FILE"
   local -a issues=()
 
-  [[ -f "$st" ]] || issues+=("缺少状态文件 state.txt")
+  # 先检查决定服务/账户恢复行为的原始字段；失败时立即返回，不做任何恢复动作。
+  if ! state_verify_fields "$st"; then
+    issues+=("state.txt 字段缺失、重复、为空或非法（服务状态必须为 0 / 1）")
+  fi
+  if ! verify_binary_fields "$dir/$META_FILE" xray_user_existed xray_group_existed; then
+    issues+=("meta.txt 缺失或字段损坏（用户/组字段必须唯一且为 0 / 1）")
+  fi
+  if (( ${#issues[@]} > 0 )); then
+    printf '%s\n' "${issues[@]}"
+    return 1
+  fi
   [[ -f "$manifest" ]] || issues+=("缺少事务清单 manifest.tsv")
 
   # 1) 事务 ID 与状态字段 + 清单完整性标记
@@ -1641,15 +1687,15 @@ verify_transaction(){
   # 2) 清单字段/路径合法性 + 3) 备份完整性（含内容校验）+ 4) 原本不存在文件的记录
   #    + 5) 路径重复与备份路径映射冲突；6) hashes.tsv 基本完整性。
   if [[ -f "$manifest" ]]; then
-    [[ -s "$manifest" ]] || issues+=("事务清单为空：$manifest")
+    file_has_final_newline "$manifest" || issues+=("事务清单为空或末行未以换行结束（可能截断）：$manifest")
     local raw s r e pre bak bfp n=0
     local -A seen_src=() seen_rel=()
-    while IFS= read -r raw; do
-      [[ -n "${raw:-}" ]] || continue
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
       n=$((n+1))
-      # 字段数量必须正确（恰好 4 列 = 3 个制表符）
-      if [[ "$(tab_count "$raw")" != "3" ]]; then
-        issues+=("清单字段数量错误（应恰好 4 列）"); continue
+      # 字段数量必须正确，且四列均非空；在 read 折叠空白分隔符之前检查空字段。
+      if [[ "$(tab_count "$raw")" != "3" || "$raw" == $'\t'* ||
+            "$raw" == *$'\t' || "$raw" == *$'\t\t'* ]]; then
+        issues+=("清单第 $n 行字段数量错误或包含空字段（应恰好 4 个非空字段）"); continue
       fi
       IFS=$'\t' read -r s r e pre <<< "$raw"
       if [[ -z "$s" || "$s" != /* || "$s" == *..* ]]; then
@@ -1683,6 +1729,7 @@ verify_transaction(){
           fi
           ;;
         0)
+          [[ "$pre" == "MISSING" ]] || issues+=("清单记录矛盾（existed=0 但安装前指纹非 MISSING）：$s")
           [[ -e "$dir/$r.absent" || -L "$dir/$r.absent" ]] ||
             issues+=("缺少 absent 标记（原本不存在）：$dir/$r.absent")
           ;;
@@ -1695,17 +1742,17 @@ verify_transaction(){
   fi
 
   # 6) hashes.tsv 基本完整性：字段数量、路径合法、指纹格式、标记必须为 post、
-  #    路径须受本事务管理；同一路径不得出现相互矛盾的记录（标记不一致）。
+  #    路径须受本事务管理；同一路径允许合法追加 post，hash_of 仍取最后一条。
   local hf="$dir/$HASH_FILE"
   if [[ -f "$hf" ]]; then
-    [[ -s "$hf" ]] || issues+=("安装后指纹文件为空：$hf")
+    file_has_final_newline "$hf" || issues+=("安装后指纹文件为空或末行未以换行结束（可能截断）：$hf")
     local hraw hs hfp htag m=0
     local -A seen_tag=()
-    while IFS= read -r hraw; do
-      [[ -n "${hraw:-}" ]] || continue
+    while IFS= read -r hraw || [[ -n "$hraw" ]]; do
       m=$((m+1))
-      if [[ "$(tab_count "$hraw")" != "2" ]]; then
-        issues+=("hashes.tsv 第 $m 行字段数量错误（应恰好 3 列）"); continue
+      if [[ "$(tab_count "$hraw")" != "2" || "$hraw" == $'\t'* ||
+            "$hraw" == *$'\t' || "$hraw" == *$'\t\t'* ]]; then
+        issues+=("hashes.tsv 第 $m 行字段数量错误或包含空字段（应恰好 3 个非空字段）"); continue
       fi
       IFS=$'\t' read -r hs hfp htag <<< "$hraw"
       if [[ -z "$hs" || "$hs" != /* || "$hs" == *..* ]]; then
@@ -1722,6 +1769,8 @@ verify_transaction(){
       manifest_has "$dir" "$hs" ||
         issues+=("hashes.tsv 记录了不受本事务管理的路径：$hs")
     done < "$hf"
+  elif [[ "$(state_get "$st" hashes_complete)" == "1" ]]; then
+    issues+=("hashes_complete=1 但缺少 hashes.tsv")
   fi
 
   if (( ${#issues[@]} > 0 )); then
@@ -2258,7 +2307,6 @@ if reality_enabled == "1":
             "realitySettings": {
                 "show": False,
                 "dest": target,
-                "xver": 0,
                 "serverNames": [sni],
                 "privateKey": private_key,
                 "shortIds": [short_id]
