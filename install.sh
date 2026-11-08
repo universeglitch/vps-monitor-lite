@@ -14,7 +14,7 @@ umask 077
 #   bash install.sh --help       查看帮助
 # =========================================================
 
-PANEL_URL="https://raw.githubusercontent.com/universeglitch/vps-monitor-lite/main/panel_dual.py"
+PANEL_URL="https://raw.githubusercontent.com/universeglitch/vps-monitor-lite/main/panel.py"
 XRAY_INSTALL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
 PANEL_DIR="/opt/node-panel"
