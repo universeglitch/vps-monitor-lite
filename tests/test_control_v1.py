@@ -42,7 +42,7 @@ class ControlTests(unittest.TestCase):
             if args[0]=='start': running['value']=True
             if args[0]=='stop': running['value']=False
             return 0, ''
-        return Active(run, lambda: now[0]), calls, running, now
+        return Active(run, lambda: now[0], readiness=lambda name: None), calls, running, now
 
     def test_heartbeat_off_no_service_calls(self):
         a,c,r,n=self.fixture(); a.desired['xray']=True

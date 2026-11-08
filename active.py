@@ -23,19 +23,33 @@ def systemctl(*args):
     command = shutil.which('systemctl')
     if command is None:
         raise ServiceError('systemctl unavailable')
+    import selectors
+    import os
+    p = subprocess.Popen([command, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+    selector=selectors.DefaultSelector(); chunks={p.stdout:bytearray(), p.stderr:bytearray()}
+    for stream in chunks: selector.register(stream, selectors.EVENT_READ)
+    deadline=time.monotonic()+10
     try:
-        p = subprocess.run([command, *args], capture_output=True, text=True, timeout=10,
-                           env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
-    except subprocess.TimeoutExpired as exc:
-        raise ServiceError('service operation timed out') from exc
-    if len(p.stdout) > 65536 or len(p.stderr) > 65536:
-        raise ServiceError('service output exceeded limit')
-    return p.returncode, p.stdout
+        while selector.get_map():
+            remaining=deadline-time.monotonic()
+            if remaining<=0: raise ServiceError('service operation timed out')
+            for key,_ in selector.select(min(remaining,0.2)):
+                data=os.read(key.fileobj.fileno(),4096)
+                if not data: selector.unregister(key.fileobj);continue
+                chunks[key.fileobj].extend(data)
+                if len(chunks[key.fileobj])>32768: raise ServiceError('service output exceeded limit')
+        return p.wait(timeout=max(.01,deadline-time.monotonic())), chunks[p.stdout].decode(errors='replace')
+    finally:
+        if p.poll() is None: p.kill()
+        p.wait();selector.close();p.stdout.close();p.stderr.close()
+
 
 
 class Active:
-    def __init__(self, run=systemctl, clock=time.monotonic):
+    def __init__(self, run=systemctl, clock=time.monotonic, readiness=None):
         self.run, self.clock = run, clock
+        self.readiness = readiness
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread = None
@@ -78,6 +92,9 @@ class Active:
             if not current['installed']:
                 raise ServiceError('service unit missing; installation confirmation required')
             if enabled:
+                if self.readiness is None:
+                    raise ServiceError('start refused: readiness validator unavailable')
+                self.readiness(name)
                 # Configuration discovery/validation belongs to Coordinator; this
                 # low-level method must only receive a prevalidated start request.
                 rc, _ = self.run('start', UNITS[name])
@@ -127,6 +144,10 @@ class Active:
                         attempts.popleft()
                     if len(attempts) >= 3 or (attempts and now - attempts[-1] < 60 * 2**(len(attempts)-1)):
                         continue
+                    if self.readiness is None:
+                        self.events.append((now, name, 'readiness unavailable; no speculative recovery'))
+                        continue
+                    self.readiness(name)
                     attempts.append(now)
                     rc, _ = self.run('start', UNITS[name])
                     self.events.append((now, name, 'recovery attempted' if rc == 0 else 'recovery failed'))
@@ -146,3 +167,11 @@ class Active:
         self.stop_event.set()
         if self.thread is not None:
             self.thread.join(timeout=12)
+
+    def apply_xray(self, was_active):
+        """Only Coordinator's confirmed transaction may call this operation."""
+        with self.lock:
+            operation = 'restart' if was_active else 'start'
+            rc, _ = self.run(operation, UNITS['xray'])
+            if rc or not self.inspect('xray')['active']:
+                raise ServiceError('Xray configuration application failed')

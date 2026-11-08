@@ -162,3 +162,200 @@ class Coordinator:
         if confirmed is not True:
             raise AuthError('explicit installation confirmation required')
         raise AuthError('installation refused: no measured installer resource profile or approved recipe')
+
+
+class XrayTransaction:
+    """Single-writer, crash-readable transactions over a private Store.
+
+    Caller supplies candidate inbounds; no protocol/port/key defaults are invented.
+    configure() requires a one-use confirmation tied to config hash and auth epoch.
+    The frozen legacy panel must not write concurrently: fingerprint CAS is not
+    atomic against a noncooperating root writer. Deployment must enforce single writer.
+    """
+    TERMINAL = ('COMMITTED', 'ROLLED_BACK')
+
+    def __init__(self, store, config, gate, test, service, authorize):
+        self.store, self.path, self.gate = store, Path(config), gate
+        self.test, self.service, self.authorize = test, service, authorize
+        self.mutex = threading.RLock()
+        self.confirmations = {}
+
+    def _read(self):
+        import stat
+        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > 262144:
+                raise AuthError('unsafe Xray configuration')
+            with os.fdopen(fd, 'rb', closefd=False) as f:
+                raw = f.read(262145)
+            if len(raw) > 262144:
+                raise AuthError('Xray configuration size limit')
+            return raw, (st.st_mode & 0o777, st.st_uid, st.st_gid)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def fingerprint(raw):
+        import hashlib
+        return hashlib.sha256(raw).hexdigest()
+
+    def _record(self, record):
+        from auth import dumps
+        self.store.write('xray-transaction.json', dumps(record))
+
+    def pending(self):
+        from auth import loads
+        raw = self.store.read('xray-transaction.json', missing=True)
+        if raw is None:
+            return None
+        r = loads(raw)
+        if r.get('stage') not in ('PREPARED','CONFIG_APPLIED','SERVICE_VERIFIED','COMMITTED','ROLLBACK_REQUIRED','ROLLED_BACK'):
+            raise AuthError('invalid Xray transaction journal')
+        for field in ('old_hash','new_hash'):
+            import re
+            if not re.fullmatch('[0-9a-f]{64}', r.get(field,'')):
+                raise AuthError('invalid Xray transaction fingerprint')
+        if type(r.get('attempts')) is not int or not 0 <= r['attempts'] <= 1:
+            raise AuthError('invalid rollback attempt count')
+        return r
+
+    def confirm(self, token):
+        epoch = self.authorize(token)
+        with self.mutex, self.store.transaction():
+            pending = self.pending()
+            if pending and pending['stage'] not in self.TERMINAL:
+                raise AuthError('unfinished Xray transaction requires recovery')
+            raw, _ = self._read()
+            ident = __import__('secrets').token_hex(32)
+            now = time.monotonic()
+            self.confirmations = {k:v for k,v in self.confirmations.items() if v['expires'] > now}
+            if len(self.confirmations) >= 16:
+                raise Busy('confirmation capacity reached')
+            self.confirmations[ident] = {'epoch': epoch, 'token': __import__('hashlib').sha256(token.encode()).hexdigest(),
+                                        'hash': self.fingerprint(raw), 'expires': now + 120}
+            return {'confirmation': ident, 'config_hash': self.fingerprint(raw),
+                    'warning': 'Applying configuration may restart Xray and disconnect existing clients', 'expires_in': 120}
+
+    def _replace(self, raw, meta, expected):
+        import tempfile
+        current, _ = self._read()
+        if self.fingerprint(current) != expected:
+            raise AuthError('external configuration change; refusing overwrite')
+        fd, tmp = tempfile.mkstemp(prefix='.vps-config-', dir=self.path.parent)
+        try:
+            os.fchmod(fd, meta[0])
+            current_stat = os.fstat(fd)
+            if (current_stat.st_uid, current_stat.st_gid) != (meta[1], meta[2]):
+                os.fchown(fd, meta[1], meta[2])
+            with os.fdopen(fd, 'wb', closefd=False) as f:
+                f.write(raw); f.flush(); os.fsync(fd)
+            again, _ = self._read()
+            if self.fingerprint(again) != expected:
+                raise AuthError('external configuration change before replacement')
+            os.replace(tmp, self.path)
+            d = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try: os.fsync(d)
+            finally: os.close(d)
+            if self.fingerprint(self._read()[0]) != self.fingerprint(raw):
+                raise AuthError('external modification after configuration replacement')
+        finally:
+            os.close(fd)
+            try: os.unlink(tmp)
+            except FileNotFoundError: pass
+
+    def configure(self, token, confirmation, replacements):
+        from auth import dumps, loads, b64
+        epoch = self.authorize(token)
+        if not isinstance(replacements, dict) or not replacements or len(replacements) > 3:
+            raise AuthError('bounded inbound mapping required')
+        allowed = ('vps-monitor-ws', 'vps-monitor-xhttp', 'vps-monitor-reality')
+        for tag, inbound in replacements.items():
+            if tag not in allowed or (inbound is not None and (not isinstance(inbound,dict) or inbound.get('tag') != tag)):
+                raise AuthError('only explicitly owned inbound tags can be changed')
+        with self.gate('xray-test'), self.mutex, self.store.transaction():
+            permit = self.confirmations.pop(confirmation, None)
+            if (not permit or permit['expires'] <= time.monotonic() or permit['epoch'] != epoch or
+                permit['token'] != __import__('hashlib').sha256(token.encode()).hexdigest()):
+                raise AuthError('valid restart confirmation required')
+            old, meta = self._read()
+            if self.fingerprint(old) != permit['hash']:
+                raise AuthError('configuration changed since confirmation')
+            config = loads(old)
+            if not isinstance(config, dict) or not isinstance(config.get('inbounds'), list):
+                raise AuthError('single JSON config with inbounds required; JSONC not rewritten')
+            owned_raw = self.store.read('xray-owned.json', missing=True)
+            owned = loads(owned_raw) if owned_raw else []
+            # Newly added owned tags must not collide with existing user tags.
+            existing = [i.get('tag') for i in config['inbounds'] if isinstance(i,dict)]
+            if len([t for t in existing if t is not None]) != len(set(t for t in existing if t is not None)):
+                raise AuthError('duplicate inbound tags')
+            for tag in replacements:
+                if tag in existing and tag not in owned:
+                    raise AuthError('existing inbound is not owned by this project')
+            inbounds=[]
+            for inbound in config['inbounds']:
+                if not isinstance(inbound,dict): raise AuthError('invalid inbound')
+                tag=inbound.get('tag')
+                if tag in replacements:
+                    if replacements[tag] is not None: inbounds.append(replacements[tag])
+                else: inbounds.append(inbound)
+            for tag,inbound in replacements.items():
+                if tag not in existing and inbound is not None: inbounds.append(inbound)
+            config['inbounds']=inbounds
+            candidate=dumps(config)
+            self.gate.checkpoint()
+            self.test(candidate)  # injected bounded Xray self-test, never shell text
+            if self.authorize(token) != epoch: raise AuthError('Session epoch changed')
+            if self.fingerprint(self._read()[0]) != permit['hash']: raise AuthError('external configuration change during test')
+            before = self.service.inspect('xray')
+            if not before['installed']: raise AuthError('Xray unit not installed')
+            record={'stage':'PREPARED','old_hash':permit['hash'],'new_hash':self.fingerprint(candidate),
+                    'old':b64(old),'candidate':b64(candidate),'meta':list(meta),'attempts':0,
+                    'was_active':before['active'], 'owned': sorted(set(owned) | set(replacements))}
+            self._record(record)
+            try:
+                self._replace(candidate,meta,permit['hash'])
+                record['stage']='CONFIG_APPLIED'; self._record(record)
+                # Restart authorized for this exact transaction, not future requests.
+                self.service.apply_xray(before['active'])
+                if self.fingerprint(self._read()[0]) != record['new_hash']: raise AuthError('external configuration change during service verification')
+                record['stage']='SERVICE_VERIFIED'; self._record(record)
+                self.store.write('xray-owned.json',dumps(record['owned']))
+                record['stage']='COMMITTED'; self._record(record)
+                return {'stage':'COMMITTED','config_hash':record['new_hash']}
+            except Exception:
+                record['stage']='ROLLBACK_REQUIRED'; self._record(record)
+                self._rollback(record)
+                raise
+
+    def _rollback(self, r):
+        from auth import unb64
+        current=self.fingerprint(self._read()[0])
+        if current not in (r['old_hash'],r['new_hash']):
+            raise AuthError('external modification; rollback refuses overwrite')
+        if r['attempts'] >= 1:
+            raise AuthError('rollback already attempted; manual recovery required')
+        r['attempts']=1; r['stage']='ROLLBACK_REQUIRED'; self._record(r)
+        old=unb64(r['old'])
+        if self.fingerprint(old)!=r['old_hash']: raise AuthError('backup fingerprint mismatch')
+        if current!=r['old_hash']: self._replace(old,r['meta'],r['new_hash'])
+        self.service.apply_xray(r['was_active'])
+        r['stage']='ROLLED_BACK'; self._record(r)
+
+    def recover(self, token, restart_confirmed=False):
+        from auth import dumps
+        self.authorize(token)
+        with self.gate('xray-test'), self.mutex, self.store.transaction():
+            r=self.pending()
+            if r is None or r['stage'] in self.TERMINAL: return r
+            current=self.fingerprint(self._read()[0])
+            if current not in (r['old_hash'],r['new_hash']): raise AuthError('external change; manual recovery required')
+            if r['stage']=='PREPARED' and current==r['old_hash']:
+                r['stage']='ROLLED_BACK';self._record(r);return r
+            # Active alone cannot prove which configuration is loaded. Never restart
+            # a healthy proxy merely because management restarted.
+            if restart_confirmed is not True:
+                return {'stage':r['stage'],'requires_confirmation':True}
+            self._rollback(r)
+            return {'stage':r['stage']}
