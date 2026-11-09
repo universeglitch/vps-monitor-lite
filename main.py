@@ -287,10 +287,23 @@ def cli():
             binary=shutil.which('systemd-run')
             if binary is None:p.error('systemd-run unavailable')
             def launcher(argv):
-                return [binary,'--quiet','--wait','--pipe','--collect','--slice='+args.task_slice,
-                        '--property=MemoryMax='+str(args.task_memory_max),'--property=TasksMax=16',
-                        '--property=RuntimeMaxSec=45','--property=KillMode=control-group',
-                        '--property=Nice=10','--',*argv]
+                # A unique unit identity is required so the transient cgroup can be
+                # addressed and stopped explicitly; the systemd-run client exit alone
+                # does not prove the systemd-owned task cgroup has stopped.
+                unit='vps-task-'+secrets.token_hex(8)+'.service'
+                def cancel():
+                    import subprocess
+                    systemctl=shutil.which('systemctl')
+                    if systemctl is None:return
+                    subprocess.run([systemctl,'--quiet','stop',unit],timeout=15,
+                                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                                   env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'})
+                command=[binary,'--quiet','--wait','--pipe','--collect','--unit='+unit,
+                         '--slice='+args.task_slice,
+                         '--property=MemoryMax='+str(args.task_memory_max),'--property=TasksMax=16',
+                         '--property=RuntimeMaxSec=45','--property=KillMode=control-group',
+                         '--property=Nice=10','--',*argv]
+                return command, cancel
         runner=BoundedCommand(gate,launcher)
         executable=shutil.which('xray')
         if args.single_writer and executable:

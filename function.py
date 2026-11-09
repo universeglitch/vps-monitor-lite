@@ -428,7 +428,10 @@ class BoundedCommand:
     """Trusted argv only; bounded stdout/stderr, timeout and pressure checkpoints.
 
     A task requiring cgroup isolation is refused unless a measured task launcher
-    is explicitly injected. Never accepts shell strings from HTTP.
+    is explicitly injected. The launcher returns ``(argv, cancel)`` where ``cancel``
+    stops and waits for the unique transient unit: killing the systemd-run client
+    process group is not proof that the systemd-owned task cgroup has stopped.
+    Never accepts shell strings from HTTP.
     """
     def __init__(self, gate, launcher=None):
         self.gate,self.launcher=gate,launcher
@@ -437,9 +440,10 @@ class BoundedCommand:
         import subprocess,selectors
         if not isinstance(argv,(list,tuple)) or not argv or any(not isinstance(a,str) for a in argv):
             raise AuthError('trusted argv required')
+        cancel=None
         if isolated:
             if self.launcher is None:raise Busy('measured transient task cgroup is not configured')
-            argv=self.launcher(tuple(argv))
+            argv,cancel=self.launcher(tuple(argv))
         self.gate.checkpoint()
         p=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                            env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'},start_new_session=True)
@@ -461,7 +465,14 @@ class BoundedCommand:
             if p.poll() is None:
                 import signal
                 os.killpg(p.pid,signal.SIGKILL)
-            p.wait();sel.close();p.stdout.close();p.stderr.close()
+            p.wait()
+            if cancel is not None:
+                # The client is a separate process from the systemd-owned unit
+                # cgroup; stop the unit explicitly instead of assuming the client
+                # exit stopped it. Bounded best-effort, never masks the real error.
+                try: cancel()
+                except Exception: pass
+            sel.close();p.stdout.close();p.stderr.close()
 
 
 class XraySelfTest:
