@@ -152,6 +152,23 @@ class AuthTests(unittest.TestCase):
         os.symlink(os.path.join(self.tmp.name, 'auth_data'), alias)
         with self.assertRaises(OSError): Store(os.path.join(alias, 'child'))
 
+    def test_nested_transaction_keeps_cross_process_lock(self):
+        import fcntl
+        lock = os.path.join(self.tmp.name, 'auth_data', 'lock')
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            with self.a.store.transaction():
+                with self.a.store.transaction():
+                    pass
+                # Inner transaction exited but the outer must still hold the
+                # cross-process flock: an independent descriptor must not acquire it.
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
 
 if __name__ == '__main__':
     unittest.main()

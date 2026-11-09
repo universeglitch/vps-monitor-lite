@@ -138,6 +138,7 @@ class Store:
     """
     def __init__(self, path):
         self.lock = threading.RLock()
+        self.lock_depth = 0
         self.poisoned = False
         self.fd = self.lockfd = None
         root = os.path.abspath(os.fspath(path))
@@ -192,14 +193,22 @@ class Store:
 
     @contextmanager
     def transaction(self):
+        # RLock is reentrant per thread, but flock() locks belong to the open file
+        # description: a nested LOCK_UN would release the cross-process lock while
+        # an outer critical section is still running. Hold LOCK_EX only at the
+        # outermost depth and release it only when the outermost scope exits.
         with self.lock:
             if self.poisoned:
                 raise UncertainCommit('storage requires restart and verification')
-            fcntl.flock(self.lockfd, fcntl.LOCK_EX)
+            if self.lock_depth == 0:
+                fcntl.flock(self.lockfd, fcntl.LOCK_EX)
+            self.lock_depth += 1
             try:
                 yield
             finally:
-                fcntl.flock(self.lockfd, fcntl.LOCK_UN)
+                self.lock_depth -= 1
+                if self.lock_depth == 0:
+                    fcntl.flock(self.lockfd, fcntl.LOCK_UN)
 
     @contextmanager
     def directory(self, area):
