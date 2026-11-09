@@ -61,3 +61,39 @@ class XrayTests(unittest.TestCase):
         self.x.test=fail;permit=self.x.confirm('token')
         with self.assertRaises(RuntimeError):self.x.configure('token',permit['confirmation'],self.new)
         self.assertEqual(old,self.path.read_bytes());self.assertEqual(self.service.calls,[])
+    def test_pending_rejects_incomplete_or_forged_journal(self):
+        # _rollback()/recover() trust old/candidate/meta/was_active/owned as direct
+        # chmod/chown/restart/ownership inputs. A partial or tampered journal must be
+        # rejected at read time instead of driving those privileged operations.
+        import hashlib
+        from auth import dumps, b64
+        old=self.path.read_bytes();candidate=b'{"inbounds":[]}'
+        base={'stage':'PREPARED','old_hash':hashlib.sha256(old).hexdigest(),
+              'new_hash':hashlib.sha256(candidate).hexdigest(),'old':b64(old),
+              'candidate':b64(candidate),'meta':[0o600,os.getuid(),os.getgid()],
+              'attempts':0,'was_active':True,'owned':['vps-monitor-ws']}
+        def journal(**override):
+            record=dict(base);record.update(override)
+            self.store.write('xray-transaction.json',dumps(record))
+        journal();self.assertEqual(self.x.pending()['stage'],'PREPARED')
+        broken={
+            'missing old bundle':{'old':None},
+            'missing candidate bundle':{'candidate':None},
+            'missing owned list':{'owned':None},
+            'old bundle does not match old_hash':{'old':b64(b'other')},
+            'candidate bundle does not match new_hash':{'candidate':b64(b'other')},
+            'metadata length':{'meta':[0o600,os.getuid()]},
+            'metadata type':{'meta':[0o600,'0',os.getgid()]},
+            'metadata mode range':{'meta':[0o7777,os.getuid(),os.getgid()]},
+            'activity flag type':{'was_active':'yes'},
+            'unknown owned tag':{'owned':['vps-monitor-ws','arbitrary']},
+            'unsorted owned tags':{'owned':['vps-monitor-ws','vps-monitor-reality']},
+            'duplicate owned tags':{'owned':['vps-monitor-ws','vps-monitor-ws']},
+            'attempt overflow':{'attempts':2},
+            'unknown stage':{'stage':'DONE'},
+        }
+        for name,change in broken.items():
+            with self.subTest(name=name):
+                journal(**change)
+                with self.assertRaises(AuthError):
+                    self.x.pending()

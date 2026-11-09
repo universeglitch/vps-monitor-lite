@@ -216,19 +216,38 @@ class XrayTransaction:
         self.store.write('xray-transaction.json', dumps(record))
 
     def pending(self):
-        from auth import loads
+        import re
+        from auth import loads, unb64
         raw = self.store.read('xray-transaction.json', missing=True)
         if raw is None:
             return None
         r = loads(raw)
+        if not isinstance(r, dict):
+            raise AuthError('invalid Xray transaction journal')
         if r.get('stage') not in ('PREPARED','CONFIG_APPLIED','SERVICE_VERIFIED','COMMITTED','ROLLBACK_REQUIRED','ROLLED_BACK'):
             raise AuthError('invalid Xray transaction journal')
         for field in ('old_hash','new_hash'):
-            import re
             if not re.fullmatch('[0-9a-f]{64}', r.get(field,'')):
                 raise AuthError('invalid Xray transaction fingerprint')
         if type(r.get('attempts')) is not int or not 0 <= r['attempts'] <= 1:
             raise AuthError('invalid rollback attempt count')
+        # Bundles, file metadata, activity flag and ownership list are replayed by
+        # _rollback()/recover() as chmod/chown/restart/ownership inputs; validate each
+        # against the recorded fingerprints before any privileged use.
+        old, candidate = unb64(r.get('old')), unb64(r.get('candidate'))
+        if self.fingerprint(old) != r['old_hash'] or self.fingerprint(candidate) != r['new_hash']:
+            raise AuthError('Xray transaction journal fingerprint mismatch')
+        meta = r.get('meta')
+        if (not isinstance(meta, list) or len(meta) != 3 or any(type(v) is not int for v in meta)
+                or not 0 <= meta[0] <= 0o777 or meta[1] < 0 or meta[2] < 0):
+            raise AuthError('invalid Xray transaction metadata')
+        if type(r.get('was_active')) is not bool:
+            raise AuthError('invalid Xray transaction activity flag')
+        owned = r.get('owned')
+        allowed = ('vps-monitor-ws','vps-monitor-xhttp','vps-monitor-reality')
+        if (not isinstance(owned, list) or any(o not in allowed for o in owned)
+                or owned != sorted(set(owned))):
+            raise AuthError('invalid Xray transaction ownership list')
         return r
 
     def confirm(self, token):
