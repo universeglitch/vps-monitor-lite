@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import tempfile
@@ -173,6 +174,21 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(info['mount_point'], '/cgroup')
         self.assertEqual(info['levels'][0]['dir'], '/cgroup/system.slice/node-panel.service')
 
+    def test_namespace_path_mount_root_default(self):
+        point = '/sys/fs/cgroup'
+        self.assertEqual(rp._namespace_path(point + '/system.slice/node-panel.service', point, '/'),
+                         '/system.slice/node-panel.service')
+        self.assertEqual(rp._namespace_path(point + '/system.slice', point, '/'), '/system.slice')
+        self.assertEqual(rp._namespace_path(point, point, '/'), '/')
+
+    def test_namespace_path_mount_root_custom(self):
+        point = '/sys/fs/cgroup'
+        self.assertEqual(rp._namespace_path(point + '/system.slice/node-panel.service', point, '/nsroot'),
+                         '/nsroot/system.slice/node-panel.service')
+        self.assertEqual(rp._namespace_path(point + '/system.slice', point, '/nsroot'),
+                         '/nsroot/system.slice')
+        self.assertEqual(rp._namespace_path(point, point, '/nsroot'), '/nsroot')
+
     def test_cgroup_numeric_ancestor_limit(self):
         self.a.standard(ancestor_max=100000000)
         info = rp.read_cgroup(self.a.source())
@@ -244,6 +260,35 @@ class ProbeTests(unittest.TestCase):
                    '29 23 0:26 / /sys/fs/cgroup\\040two rw - cgroup2 cgroup2 rw\n')
         info = rp.read_mountinfo(self.a.source())
         self.assertEqual(info['mount_point'], '/sys/fs/cgroup two')
+
+    def test_cgroup_symlink_component_refused(self):
+        self.a.put('proc/meminfo', DEFAULT_MEMINFO)
+        self.a.put('proc/self/cgroup', '0::/system.slice/node-panel.service\n')
+        self.a.put('proc/self/mountinfo',
+                   '29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n')
+        # the real files live outside the cgroup mount; a symlink bridges to them
+        self.a.put('escape/node-panel.service/memory.current', '1000')
+        self.a.put('escape/node-panel.service/memory.max', 'max')
+        self.a.put('escape/node-panel.service/memory.events', DEFAULT_EVENTS)
+        (self.a.root / 'sys/fs/cgroup').mkdir(parents=True, exist_ok=True)
+        os.symlink(str(self.a.root / 'escape'),
+                   str(self.a.root / 'sys/fs/cgroup/system.slice'))
+        with self.assertRaises(rp.CgroupError):
+            rp.read_cgroup(self.a.source())
+
+    def test_cgroup_leaf_symlink_refused(self):
+        self.a.put('proc/meminfo', DEFAULT_MEMINFO)
+        self.a.put('proc/self/cgroup', '0::/system.slice/node-panel.service\n')
+        self.a.put('proc/self/mountinfo',
+                   '29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n')
+        self.a.put('outside/memory.current', '1000')
+        self.a.put('outside/memory.max', 'max')
+        self.a.put('outside/memory.events', DEFAULT_EVENTS)
+        (self.a.root / 'sys/fs/cgroup/system.slice').mkdir(parents=True, exist_ok=True)
+        os.symlink(str(self.a.root / 'outside'),
+                   str(self.a.root / 'sys/fs/cgroup/system.slice/node-panel.service'))
+        with self.assertRaises(rp.CgroupError):
+            rp.read_cgroup(self.a.source())
 
     # -------------------------------------------------------------- events --
 
@@ -329,6 +374,57 @@ class ProbeTests(unittest.TestCase):
         psi = rp.read_psi(self.a.source())
         self.assertFalse(psi['supported'])
         self.assertEqual(psi['status'], 'malformed')
+
+    def test_psi_invalid_utf8(self):
+        target = self.a.put('proc/pressure/memory', DEFAULT_PSI)
+        target.write_bytes(b'some avg10=\xff\xfe avg60=0.00 avg300=0.00 total=0\n'
+                           b'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+        psi = rp.read_psi(self.a.source())
+        self.assertFalse(psi['supported'])
+        self.assertEqual(psi['status'], 'malformed')
+
+    def test_snapshot_survives_invalid_utf8_psi(self):
+        self.a.standard(psi=None)
+        target = self.a.root / 'proc/pressure/memory'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'\xff\xfe\x00garbage')
+        snap = rp.snapshot(source=self.a.source(),
+                           system={'cpu_count': 1, 'arch': 'x', 'page_size': 4096})
+        self.assertTrue(snap['valid'])
+        self.assertFalse(snap['psi']['supported'])
+        self.assertEqual(snap['psi']['status'], 'malformed')
+
+    def test_psi_unknown_field_rejected(self):
+        self.a.put('proc/pressure/memory',
+                   'some avg10=0.00 avg60=0.00 avg300=0.00 total=0 bogus=1\n'
+                   'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+        psi = rp.read_psi(self.a.source())
+        self.assertFalse(psi['supported'])
+        self.assertEqual(psi['status'], 'malformed')
+
+    def test_psi_unknown_avg_window_rejected(self):
+        self.a.put('proc/pressure/memory',
+                   'some avg10=0.00 avg60=0.00 avg300=0.00 avg999=0.00 total=0\n'
+                   'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+        psi = rp.read_psi(self.a.source())
+        self.assertFalse(psi['supported'])
+        self.assertEqual(psi['status'], 'malformed')
+
+    def test_psi_duplicate_field_rejected(self):
+        self.a.put('proc/pressure/memory',
+                   'some avg10=0.00 avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
+                   'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+        psi = rp.read_psi(self.a.source())
+        self.assertFalse(psi['supported'])
+        self.assertEqual(psi['status'], 'malformed')
+
+    def test_parse_psi_field_rules(self):
+        with self.assertRaises(rp.FormatError):
+            rp._parse_psi('some avg10=0.00 avg60=0.00 avg300=0.00 total=0 extra=1\n'
+                          'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+        with self.assertRaises(rp.FormatError):
+            rp._parse_psi('some avg10=0.00 avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
+                          'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
 
     # ------------------------------------------------------------ snapshot --
 

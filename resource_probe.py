@@ -31,6 +31,7 @@ MEMINFO_KEYS = ('MemTotal', 'MemAvailable', 'SwapTotal', 'SwapFree')
 CGROUP_REQUIRED_FILES = ('memory.current', 'memory.max', 'memory.events')
 EVENT_KEYS_REQUIRED = ('high', 'max', 'oom', 'oom_kill')
 EVENT_KEYS_OPTIONAL = ('low',)
+PSI_KEYS = ('avg10', 'avg60', 'avg300', 'total')
 
 
 class ProbeError(Exception):
@@ -116,6 +117,10 @@ class Source:
 
     def exists(self, path):
         return self._resolve(path).exists()
+
+    def realpath(self, path):
+        """Return the fully resolved on-disk path (follows symlinks)."""
+        return os.path.realpath(str(self._resolve(path)))
 
 
 def _nonneg_int(text, name):
@@ -255,6 +260,31 @@ def _namespace_path(dir_path, mount_point, mount_root):
     return (mount_root.rstrip('/') + suffix) or '/'
 
 
+def _assert_within_mount(source, mount_point, target):
+    """Refuse a cgroup directory that could leave the mount point.
+
+    Lexical prefix checks are not sufficient: any real symlink component below
+    the mount point, or a directory whose resolved location sits outside the
+    mount, must abort. Both are enforced here.
+    """
+    stop = mount_point.rstrip('/') or '/'
+    prefix = stop if stop.endswith('/') else stop + '/'
+    node = target.rstrip('/') or '/'
+    if node != stop and not node.startswith(prefix):
+        raise CgroupError('cgroup path lies outside the mount point')
+    while node != stop:
+        if source.is_symlink(node):
+            raise CgroupError('cgroup path component is a symlink: ' + node)
+        parent = str(Path(node).parent)
+        if parent == node:
+            raise CgroupError('cgroup path lies outside the mount point')
+        node = parent
+    mount_real = source.realpath(stop)
+    target_real = source.realpath(target)
+    if target_real != mount_real and not target_real.startswith(mount_real + os.sep):
+        raise CgroupError('cgroup directory escapes the mount point')
+
+
 def _parse_events(text):
     counts = {}
     for line in text.splitlines():
@@ -318,6 +348,7 @@ def read_cgroup(source):
         raise CgroupError('mapped cgroup directory does not exist')
     levels = []
     for dir_path in _ancestry(start, mount_point):
+        _assert_within_mount(source, mount_point, dir_path)
         namespace = _namespace_path(dir_path, mount_point, mount_root)
         levels.append(read_cgroup_level(source, dir_path, namespace))
     return {'supported': True, 'version': 2,
@@ -343,17 +374,19 @@ def _parse_psi(text):
             if '=' not in token:
                 raise FormatError('pressure: malformed token')
             key, value = token.split('=', 1)
-            if key.startswith('avg'):
-                if not re.fullmatch(r'\d+\.\d+', value):
-                    raise FormatError('pressure: malformed average')
-                values[key] = float(value)
-            elif key == 'total':
+            if key not in PSI_KEYS:
+                raise FormatError('pressure: unknown field ' + key)
+            if key in values:
+                raise FormatError('pressure: duplicate field ' + key)
+            if key == 'total':
                 if not re.fullmatch(r'\d+', value):
                     raise FormatError('pressure: malformed total')
                 values[key] = int(value)
             else:
-                raise FormatError('pressure: unknown field ' + key)
-        for key in ('avg10', 'avg60', 'avg300', 'total'):
+                if not re.fullmatch(r'\d+\.\d+', value):
+                    raise FormatError('pressure: malformed average')
+                values[key] = float(value)
+        for key in PSI_KEYS:
             if key not in values:
                 raise FormatError('pressure: missing ' + key)
         result[kind] = values
@@ -373,6 +406,8 @@ def read_psi(source):
         return {'supported': False, 'status': 'unsupported', 'reason': 'kernel exposes no psi'}
     except PermissionDenied:
         return {'supported': False, 'status': 'permission', 'reason': 'psi read denied'}
+    except FormatError:
+        return {'supported': False, 'status': 'malformed', 'reason': 'psi not valid utf-8'}
     except (TooLarge, ReadError):
         return {'supported': False, 'status': 'error', 'reason': 'psi unreadable'}
     try:
@@ -432,7 +467,10 @@ def snapshot(source=None, system=None, clock=None):
         for level in cgroup['levels']:
             if level['peak_status'] == 'error':
                 issues.append(_issue('cgroup-peak', level['path'], 'memory.peak unreadable'))
-    psi = read_psi(source)
+    try:
+        psi = read_psi(source)
+    except ProbeError as exc:
+        psi = {'supported': False, 'status': 'error', 'reason': str(exc)}
     if not psi.get('supported'):
         issues.append(_issue('psi', psi.get('status', 'unsupported'), psi.get('reason', '')))
     system = system if system is not None else read_system()
