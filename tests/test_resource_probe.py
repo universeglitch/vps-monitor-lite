@@ -290,6 +290,76 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaises(rp.CgroupError):
             rp.read_cgroup(self.a.source())
 
+    # ------------------------------------------------------ _assert_within_mount --
+
+    def test_assert_within_mount_accepts_child_of_root_mount(self):
+        # A cgroup2 mount at '/' must accept every legal descendant: the old
+        # 'mount_real + os.sep' prefix test compared against '//' and refused
+        # them all. Source('/') makes the real path of the mount be '/'.
+        source = rp.Source('/')
+        rp._assert_within_mount(source, '/', str(self.tmp.name))
+        rp._assert_within_mount(source, '/', '/')
+
+    def test_assert_within_mount_accepts_child(self):
+        self.a.put('sys/fs/cgroup/system.slice/memory.current', '1')
+        rp._assert_within_mount(self.a.source(), '/sys/fs/cgroup',
+                                '/sys/fs/cgroup/system.slice')
+
+    def test_assert_within_mount_refuses_outside(self):
+        with self.assertRaises(rp.CgroupError):
+            rp._assert_within_mount(self.a.source(), '/sys/fs/cgroup', '/other/path')
+
+    def test_assert_within_mount_refuses_prefix_lookalike(self):
+        with self.assertRaises(rp.CgroupError):
+            rp._assert_within_mount(self.a.source(), '/sys/fs/cgroup', '/sys/fs/cgroup2')
+
+    def test_assert_within_mount_refuses_symlink_below_mount(self):
+        self.a.put('escape/memory.current', '1')
+        (self.a.root / 'sys/fs/cgroup').mkdir(parents=True, exist_ok=True)
+        os.symlink(str(self.a.root / 'escape'),
+                   str(self.a.root / 'sys/fs/cgroup/system.slice'))
+        with self.assertRaises(rp.CgroupError):
+            rp._assert_within_mount(self.a.source(), '/sys/fs/cgroup',
+                                    '/sys/fs/cgroup/system.slice/node-panel.service')
+
+    # ------------------------------------------------------- Source.root guard --
+
+    def test_source_rejects_parent_component(self):
+        outside = self.second()
+        outside.put('secret.txt', 'top-secret')
+        rel = os.path.relpath(str(outside.root), str(self.a.root))  # '../<sibling>'
+        with self.assertRaises(rp.ReadError):
+            self.a.source().read_text('/' + rel + '/secret.txt', rp.MEMINFO_LIMIT)
+
+    def test_source_rejects_deep_parent_component(self):
+        outside = self.second()
+        outside.put('secret.txt', 'top-secret')
+        nested = self.a.root / 'proc' / 'deep' / 'nested'
+        nested.mkdir(parents=True)
+        rel = os.path.relpath(str(outside.root), str(nested))  # '../../../../<sibling>'
+        with self.assertRaises(rp.ReadError):
+            self.a.source().read_text('/proc/deep/nested/' + rel + '/secret.txt',
+                                      rp.MEMINFO_LIMIT)
+
+    def test_source_rejects_absolute_symlink_escape(self):
+        secret = self.second().put('secret.txt', 'top-secret')
+        os.symlink(str(secret), str(self.a.root / 'link'))
+        with self.assertRaises(rp.ReadError):
+            self.a.source().read_text('/link', rp.MEMINFO_LIMIT)
+
+    def test_source_rejects_relative_symlink_escape(self):
+        secret = self.second().put('secret.txt', 'top-secret')
+        rel = os.path.relpath(str(secret), str(self.a.root))
+        os.symlink(rel, str(self.a.root / 'link'))
+        with self.assertRaises(rp.ReadError):
+            self.a.source().read_text('/link', rp.MEMINFO_LIMIT)
+
+    def test_source_allows_internal_symlink(self):
+        self.a.put('proc/meminfo', DEFAULT_MEMINFO)
+        os.symlink('meminfo', str(self.a.root / 'proc/alias'))
+        text = self.a.source().read_text('/proc/alias', rp.MEMINFO_LIMIT)
+        self.assertIn('MemTotal', text)
+
     # -------------------------------------------------------------- events --
 
     def test_events_missing_required(self):

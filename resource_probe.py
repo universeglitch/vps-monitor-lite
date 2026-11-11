@@ -85,7 +85,27 @@ class Source:
         self.root = Path(root)
 
     def _resolve(self, path):
-        return self.root / str(path).lstrip('/')
+        """Map an interface path onto this source root, refusing escapes.
+
+        ``/proc`` is read as ``<root>/proc`` so tests can point a Source at a
+        temporary tree. Two independent guards keep reads inside ``root``:
+        a ``..`` component is refused lexically, and the real path of the
+        result must stay under the real path of ``root`` (which also covers
+        absolute and relative symlinks that lead outside the root).
+        """
+        relative = str(path).lstrip('/')
+        if '..' in Path(relative).parts:
+            raise ReadError(str(path) + ': path escapes the source root')
+        target = self.root / relative
+        root_real = os.path.realpath(str(self.root))
+        target_real = os.path.realpath(str(target))
+        try:
+            inside = os.path.commonpath([root_real, target_real]) == root_real
+        except ValueError:
+            inside = False
+        if not inside:
+            raise ReadError(str(path) + ': path escapes the source root')
+        return target
 
     def read_bytes(self, path, limit):
         target = self._resolve(path)
@@ -281,7 +301,14 @@ def _assert_within_mount(source, mount_point, target):
         node = parent
     mount_real = source.realpath(stop)
     target_real = source.realpath(target)
-    if target_real != mount_real and not target_real.startswith(mount_real + os.sep):
+    # os.path.commonpath treats a mount at '/' correctly (a mount_real of '/'
+    # must contain every child), where a 'mount_real + os.sep' prefix test
+    # compared against '//' and wrongly rejected every legal child of '/'.
+    try:
+        inside = os.path.commonpath([mount_real, target_real]) == mount_real
+    except ValueError:
+        inside = False
+    if not inside:
         raise CgroupError('cgroup directory escapes the mount point')
 
 
