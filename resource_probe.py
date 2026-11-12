@@ -566,12 +566,21 @@ def compare_dynamic(first, second):
     for path in sorted(set(left_levels) & set(right_levels)):
         before, after = left_levels[path]['events'], right_levels[path]['events']
         deltas = dict((key, after.get(key, 0) - before.get(key, 0)) for key in after)
-        new_oom += deltas.get('oom', 0)
-        new_oom_kill += deltas.get('oom_kill', 0)
-        high_increase += deltas.get('high', 0)
-        max_increase += deltas.get('max', 0)
+        # A counter that moved backwards is a reset: its contribution for this
+        # interval is 0, never a negative amount. Each counter is clamped on
+        # its own and each path is handled separately, so a reset in one
+        # counter or path cannot cancel real growth in another. counter_reset
+        # lists each affected path once, in the stable sorted order above.
+        # Only the two endpoints are compared, so a reset that climbs back
+        # above its earlier value is still reported as an (understated)
+        # increase and does not appear in counter_reset; the probe does not
+        # sample between the two snapshots.
         if any(value < 0 for value in deltas.values()):
             counter_reset.append(path)
+        new_oom += max(deltas.get('oom', 0), 0)
+        new_oom_kill += max(deltas.get('oom_kill', 0), 0)
+        high_increase += max(deltas.get('high', 0), 0)
+        max_increase += max(deltas.get('max', 0), 0)
     psi = {'changed': False, 'comparable': False}
     before_psi, after_psi = first.get('psi') or {}, second.get('psi') or {}
     if before_psi.get('supported') and after_psi.get('supported'):

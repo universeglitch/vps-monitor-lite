@@ -620,7 +620,86 @@ class ProbeTests(unittest.TestCase):
         b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
         result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
         self.assertIn('/system.slice/node-panel.service', result['counter_reset'])
-        self.assertLess(result['new_oom'], 0)
+        # A reset contributes 0, never a negative amount.
+        self.assertEqual(result['new_oom'], 0)
+
+    def _leaf(self):
+        return '/system.slice/node-panel.service'
+
+    def test_dynamic_oom_reset_ignored(self):
+        self.a.standard(events='low 0\nhigh 0\nmax 0\noom 2\noom_kill 0\n')
+        b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
+        result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
+        self.assertEqual(result['new_oom'], 0)
+        self.assertIn(self._leaf(), result['counter_reset'])
+
+    def test_dynamic_oom_kill_reset_ignored(self):
+        self.a.standard(events='low 0\nhigh 0\nmax 0\noom 0\noom_kill 2\n')
+        b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
+        result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
+        self.assertEqual(result['new_oom_kill'], 0)
+        self.assertIn(self._leaf(), result['counter_reset'])
+
+    def test_dynamic_high_reset_ignored(self):
+        self.a.standard(events='low 0\nhigh 2\nmax 0\noom 0\noom_kill 0\n')
+        b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
+        result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
+        self.assertEqual(result['high_increase'], 0)
+        self.assertIn(self._leaf(), result['counter_reset'])
+
+    def test_dynamic_max_reset_ignored(self):
+        self.a.standard(events='low 0\nhigh 0\nmax 2\noom 0\noom_kill 0\n')
+        b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
+        result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
+        self.assertEqual(result['max_increase'], 0)
+        self.assertIn(self._leaf(), result['counter_reset'])
+
+    def test_dynamic_same_path_mixed_growth_and_reset(self):
+        # One counter grows, another on the same path resets: the growth must
+        # survive, the reset must only zero its own counter.
+        self.a.standard(events='low 0\nhigh 0\nmax 0\noom 1\noom_kill 3\n')
+        b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 4\noom_kill 0\n')
+        result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
+        self.assertEqual(result['new_oom'], 3)
+        self.assertEqual(result['new_oom_kill'], 0)
+        self.assertIn(self._leaf(), result['counter_reset'])
+
+    def test_dynamic_reset_does_not_offset_other_path(self):
+        # Path A: oom 0 -> 5. Path B: oom 10 -> 0 (reset). The reset on B must
+        # not cancel A's real growth.
+        self.a.standard(events='low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
+        self.a.put('sys/fs/cgroup/system.slice/memory.events',
+                   'low 0\nhigh 0\nmax 0\noom 10\noom_kill 0\n')
+        b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 5\noom_kill 0\n')
+        b.put('sys/fs/cgroup/system.slice/memory.events',
+              'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
+        result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
+        self.assertEqual(result['new_oom'], 5)
+        self.assertIn('/system.slice', result['counter_reset'])
+        self.assertNotIn(self._leaf(), result['counter_reset'])
+
+    def test_dynamic_counter_reset_order_is_stable_and_deduped(self):
+        # Two resetting paths are reported once each, in sorted order.
+        self.a.standard(events='low 0\nhigh 0\nmax 0\noom 2\noom_kill 0\n')
+        self.a.put('sys/fs/cgroup/system.slice/memory.events',
+                   'low 0\nhigh 0\nmax 0\noom 3\noom_kill 0\n')
+        b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
+        b.put('sys/fs/cgroup/system.slice/memory.events',
+              'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n')
+        result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
+        self.assertEqual(result['counter_reset'], ['/system.slice', self._leaf()])
+        self.assertEqual(result['new_oom'], 0)
+
+    def test_dynamic_reset_then_growth_is_endpoint_only(self):
+        # Known limitation: 5 -> 0 -> 7 between the two samples. Only the two
+        # endpoints are compared, so the intermediate reset is invisible. The
+        # endpoint delta is +2 and the path is NOT flagged - the implementation
+        # does not detect (and does not claim to detect) the mid-interval reset.
+        self.a.standard(events='low 0\nhigh 0\nmax 0\noom 5\noom_kill 0\n')
+        b = self.second().standard(events='low 0\nhigh 0\nmax 0\noom 7\noom_kill 0\n')
+        result = rp.compare_dynamic(self._snap(self.a), self._snap(b))
+        self.assertEqual(result['new_oom'], 2)
+        self.assertNotIn(self._leaf(), result['counter_reset'])
 
     def test_dynamic_psi_change(self):
         self.a.standard()
