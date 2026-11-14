@@ -14,8 +14,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -891,6 +892,480 @@ class SafetyTests(BenchBase):
             "    raise SystemExit('FAIL: empty profile accepted under -O')\n"
         )
         proc = subprocess.run([sys.executable, '-O', '-c', code], cwd=REPO, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn('PASS', proc.stdout)
+
+
+def run_cli(argv):
+    """Run the CLI capturing stdout and stderr (stderr carries refusal output)."""
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = rb.main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+# ------------------------------------------------ measurement boundary (P0-1) --
+
+class MeasurementBoundaryTests(BenchBase):
+    def _recorder(self, order):
+        class Recorder:
+            def prepare(self):
+                order.append('prepare')
+                return {'ok': True}
+
+            def invoke(self, prepared):
+                order.append('invoke')
+                return 0
+
+            def cleanup(self, prepared):
+                order.append('cleanup')
+
+        return Recorder()
+
+    def test_preparation_precedes_pre_current_and_cleanup_follows_peak(self):
+        tree = self.tree()
+        order = []
+        original = rb.read_self_memory
+
+        def recording_read(source=None):
+            order.append('read')
+            return original(source)
+
+        with mock.patch.object(rb, 'build_fixture', return_value=self._recorder(order)), \
+                mock.patch.object(rb, 'read_self_memory', side_effect=recording_read):
+            result = rb.run_scope_operation('login', source=tree.source())
+        self.assertEqual(result['status'], rb.STATUS_OK)
+        # probe -> prepare -> pre_current -> invoke -> peak -> cleanup
+        self.assertEqual(order, ['read', 'prepare', 'read', 'invoke', 'read', 'cleanup'])
+
+    def test_preparation_cost_is_not_charged_to_the_increment(self):
+        tree = self.tree()
+        reads = itertools.count(1)
+
+        def fake_read(source=None):
+            n = next(reads)
+            peak = 3000 if n >= 3 else 1000
+            return {'dir': '/x', 'current': 1000, 'peak': peak, 'peak_status': 'ok'}
+
+        with mock.patch.object(rb, 'build_fixture', return_value=self._recorder([])), \
+                mock.patch.object(rb, 'read_self_memory', side_effect=fake_read):
+            result = rb.run_scope_operation('login', source=tree.source())
+        self.assertEqual(result['status'], rb.STATUS_OK)
+        self.assertEqual(result['increment'], 2000)
+
+
+class FixtureCleanupTests(BenchBase):
+    def test_cleanup_runs_even_when_the_operation_fails(self):
+        tree = self.tree()
+        order = []
+
+        class Failing:
+            def prepare(self):
+                order.append('prepare')
+                return {}
+
+            def invoke(self, prepared):
+                order.append('invoke')
+                raise rb.OperationFailed('boom')
+
+            def cleanup(self, prepared):
+                order.append('cleanup')
+
+        with mock.patch.object(rb, 'build_fixture', return_value=Failing()):
+            result = rb.run_scope_operation('qr', source=tree.source(), capabilities={'qr': {}})
+        self.assertEqual(result['status'], rb.STATUS_ERROR)
+        self.assertEqual(order, ['prepare', 'invoke', 'cleanup'])
+
+    def test_cleanup_failure_is_reported_not_hidden(self):
+        tree = self.tree()
+
+        class Leaky:
+            def prepare(self):
+                return {}
+
+            def invoke(self, prepared):
+                return 0
+
+            def cleanup(self, prepared):
+                raise OSError('cannot remove temporary vault')
+
+        with mock.patch.object(rb, 'build_fixture', return_value=Leaky()):
+            result = rb.run_scope_operation('qr', source=tree.source(), capabilities={'qr': {}})
+        self.assertEqual(result['status'], rb.STATUS_OK)
+        self.assertIn('cleanup', result['cleanup_issue'])
+
+
+# ------------------------------------------------- capability results (P0-5) --
+
+class CapabilityResultTests(BenchBase):
+    def fixture(self, argv, timeout=5, op='qr'):
+        return rb.CapabilityFixture(op, {op: {'argv': argv, 'timeout': timeout}})
+
+    def test_success_returns_zero(self):
+        fixture = self.fixture([sys.executable, '-c', 'raise SystemExit(0)'])
+        self.assertEqual(fixture.invoke(fixture.prepare()), 0)
+
+    def test_nonzero_exit_is_a_failed_operation(self):
+        fixture = self.fixture([sys.executable, '-c', 'raise SystemExit(3)'])
+        with self.assertRaises(rb.OperationFailed):
+            fixture.invoke(fixture.prepare())
+
+    def test_timeout_is_a_failed_operation(self):
+        fixture = self.fixture([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=1)
+        with self.assertRaises(rb.OperationFailed):
+            fixture.invoke(fixture.prepare())
+
+    def test_unlaunchable_command_is_a_failed_operation(self):
+        fixture = self.fixture(['/nonexistent/benchmark-binary-xyz'])
+        with self.assertRaises(rb.OperationFailed):
+            fixture.invoke(fixture.prepare())
+
+    def test_operation_outside_the_capability_set_is_blocked(self):
+        with self.assertRaises(rb.Blocked):
+            rb.CapabilityFixture('login', {'login': {'argv': ['/bin/true']}}).prepare()
+
+    def test_scope_operation_rejects_nonzero_capability(self):
+        tree = self.tree()
+        caps = {'qr': {'argv': [sys.executable, '-c', 'raise SystemExit(3)'], 'timeout': 5}}
+        result = rb.run_scope_operation('qr', source=tree.source(), capabilities=caps)
+        self.assertEqual(result['status'], rb.STATUS_ERROR)
+
+
+# ------------------------------------------------------ scope timeout (P1-2) --
+
+class _BlockingStream:
+    def readline(self):
+        time.sleep(30)
+        return ''
+
+
+class _FakeScopeProc:
+    def __init__(self):
+        self.stdin = io.StringIO()
+        self.stdout = _BlockingStream()
+        self.stderr = io.StringIO()
+        self.killed = False
+
+    def poll(self):
+        return -9 if self.killed else None
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class ScopeTimeoutTests(BenchBase):
+    def test_blocking_readline_times_out(self):
+        read_end, write_end = os.pipe()
+        stream = os.fdopen(read_end, 'r')
+        try:
+            line, failure = rb.RealScopeMeter._read_line_with_timeout(stream, 0.2)
+        finally:
+            # Close the write end so the helper reader thread sees EOF, then
+            # close our handle to the read end so no descriptor is leaked.
+            os.close(write_end)
+            stream.close()
+        self.assertIsNone(line)
+        self.assertEqual(failure, 'timeout')
+
+    def test_measure_times_out_and_reaps_the_scope(self):
+        captured = {}
+
+        def fake_popen(argv, **kwargs):
+            captured['proc'] = _FakeScopeProc()
+            return captured['proc']
+
+        meter = rb.RealScopeMeter(systemd_run='/bin/echo', timeout=1, popen=fake_popen)
+        with self.assertRaises(rb.Blocked):
+            meter.measure('login')
+        self.assertTrue(captured['proc'].killed)
+
+
+# ------------------------------------------- controller chain leaf/ancestor ---
+
+class ControllerChainTests(BenchBase):
+    def test_middle_ancestor_without_subtree_control_is_indeterminate(self):
+        tree = Tree(self.dir).standard()
+        os.remove(str(Path(self.dir) / 'sys/fs/cgroup/system.slice/cgroup.subtree_control'))
+        tree.scope()
+        service = rb.read_envelope(tree.source(), '/system.slice/node-panel.service')
+        scope = rb.read_envelope(tree.source(), '/system.slice/run-abc.scope')
+        self.assertEqual(rb.compare_environments(service, scope)['state'], rb.INDETERMINATE)
+
+    def test_middle_ancestor_absent_subtree_is_indeterminate_directly(self):
+        tree = Tree(self.dir).standard()
+        os.remove(str(Path(self.dir) / 'sys/fs/cgroup/system.slice/cgroup.subtree_control'))
+        service = rb.read_envelope(tree.source(), '/system.slice/node-panel.service')
+        indeterminate, _reasons = rb._controller_chain(service)
+        self.assertTrue(indeterminate)
+
+    def test_leaf_without_subtree_control_is_still_equivalent(self):
+        tree = self.tree()
+        tree.scope()
+        service = rb.read_envelope(tree.source(), '/system.slice/node-panel.service')
+        scope = rb.read_envelope(tree.source(), '/system.slice/run-abc.scope')
+        self.assertEqual(rb.compare_environments(service, scope)['state'], rb.EQUIVALENT)
+
+
+# --------------------------------------- external local-envelope gate (P1-4) --
+
+class ExternalLocalEnvelopeTests(BenchBase):
+    def test_missing_local_envelope_is_not_verified(self):
+        tree = Tree(self.dir).standard()
+        envelope = rb.read_envelope(tree.source(), '/system.slice/node-panel.service')
+        doc = make_doc(envelope)
+        verdict = rb.validate_external_document(doc, None)
+        self.assertFalse(verdict['verified'])
+        self.assertTrue(any('equivalence' in i for i in verdict['issues']))
+
+    def test_external_cli_reports_not_verified_without_local_environment(self):
+        tree = Tree(self.dir).standard()
+        envelope = rb.read_envelope(tree.source(), '/system.slice/node-panel.service')
+        doc = make_doc(envelope)
+        path = os.path.join(self.dir, 'ext.json')
+        Path(path).write_text(json.dumps(doc))
+        code, out, _err = run_cli(['external', '--document', path, '--root', self.dir])
+        self.assertEqual(code, 2)
+        self.assertFalse(json.loads(out)['verified'])
+
+
+# ----------------------------------------- profile fingerprint integrity -----
+
+class FingerprintIntegrityTests(BenchBase):
+    def test_fingerprint_covers_operations(self):
+        profile = complete_profile()
+        profile['operations']['qr']['samples'] = [9999]
+        with self.assertRaises(rb.BenchmarkError):
+            rb.validate_profile(profile)
+
+    def test_fingerprint_covers_generated_at(self):
+        profile = complete_profile()
+        profile['generated_at'] = '2099-01-01T00:00:00+00:00'
+        with self.assertRaises(rb.BenchmarkError):
+            rb.validate_profile(profile)
+
+    def test_fingerprint_covers_environment(self):
+        profile = complete_profile()
+        profile['environment'] = {'injected': True}
+        with self.assertRaises(rb.BenchmarkError):
+            rb.validate_profile(profile)
+
+    def test_non_hex_fingerprint_is_rejected(self):
+        profile = complete_profile()
+        profile['fingerprint'] = 'not-a-real-digest'
+        with self.assertRaises(rb.BenchmarkError):
+            rb.validate_profile(profile)
+
+    def test_loads_profile_validates_fully(self):
+        raw = rb.dumps_profile(complete_profile())
+        tampered = json.loads(raw)
+        tampered['profiles']['qr'] = 1
+        with self.assertRaises(rb.BenchmarkError):
+            rb.loads_profile(json.dumps(tampered).encode())
+
+
+# ------------------------------------------------ feasibility gate (P0-2) -----
+
+class FeasibilityGateTests(BenchBase):
+    def _operations(self):
+        return dict((op, {'status': rb.STATUS_OK, 'samples': [4096]}) for op in rb.ALL_OPS)
+
+    def _profiles(self):
+        return dict((op, 4096) for op in rb.ALL_OPS)
+
+    def test_infeasible_profile_is_downgraded_to_incomplete(self):
+        profile = rb.build_profile(self._operations(), _constants(), self._profiles(),
+                                   1024, 5000, None, rb.EQUIVALENT)
+        self.assertEqual(profile['status'], rb.STATUS_INCOMPLETE)
+        self.assertTrue(any('feasibility' in r for r in profile['issues']))
+
+    def test_feasible_profile_stays_complete(self):
+        profile = rb.build_profile(self._operations(), _constants(), self._profiles(),
+                                   1024, 50000000, None, rb.EQUIVALENT)
+        self.assertEqual(profile['status'], rb.STATUS_COMPLETE)
+
+    def test_complete_profile_never_adds_a_normal_lane(self):
+        profile = rb.build_profile(self._operations(), _constants(), self._profiles(),
+                                   1024, 50000000, None, rb.EQUIVALENT)
+        self.assertNotIn('normal', profile['profiles'])
+
+    def test_validate_rejects_infeasible_complete(self):
+        profile = complete_profile()
+        profile['available_floor'] = 100
+        profile['fingerprint'] = rb.profile_fingerprint(profile)
+        with self.assertRaises(rb.BenchmarkError):
+            rb.validate_profile(profile)
+
+
+# ------------------------------------------------- candidate path safety -----
+
+class CandidatePathTests(BenchBase):
+    def writer(self):
+        return rb.ProfileWriter(os.path.join(self.dir, 'resource-profile.json'))
+
+    def test_default_candidate_is_distinct(self):
+        writer = self.writer()
+        self.assertIsNone(writer.candidate_conflict(writer.candidate_path()))
+
+    def test_candidate_on_formal_is_rejected(self):
+        writer = self.writer()
+        self.assertIsNotNone(writer.candidate_conflict(writer.path))
+
+    def test_candidate_on_backup_is_rejected(self):
+        writer = self.writer()
+        self.assertIsNotNone(writer.candidate_conflict(writer.backup_path))
+
+    def test_candidate_alias_is_rejected(self):
+        writer = self.writer()
+        alias = os.path.join(self.dir, '.', 'resource-profile.json')
+        self.assertIsNotNone(writer.candidate_conflict(alias))
+
+    def test_candidate_symlink_to_formal_is_rejected(self):
+        writer = self.writer()
+        Path(writer.path).write_bytes(rb.dumps_profile(complete_profile()))
+        link = os.path.join(self.dir, 'sneaky.json')
+        os.symlink(writer.path, link)
+        self.assertIsNotNone(writer.candidate_conflict(link))
+
+    def test_benchmark_cli_refuses_candidate_on_formal(self):
+        formal = os.path.join(self.dir, 'resource-profile.json')
+        code, _out, _err = run_cli(['benchmark', '--profile', formal, '--candidate', formal,
+                                    '--root', self.dir])
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(formal))
+
+    def test_benchmark_cli_refuses_candidate_on_backup(self):
+        formal = os.path.join(self.dir, 'resource-profile.json')
+        code, _out, _err = run_cli(['benchmark', '--profile', formal,
+                                    '--candidate', formal + '.bak', '--root', self.dir])
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(formal + '.bak'))
+
+
+# ------------------------------------- commit-uncertain cross-process (P0-4) --
+
+class CommitRecoveryTests(BenchBase):
+    def writer(self):
+        return rb.ProfileWriter(os.path.join(self.dir, 'resource-profile.json'))
+
+    def test_uncertain_state_survives_writer_recreation(self):
+        first = self.writer()
+        with mock.patch.object(rb, '_fsync_dir', side_effect=OSError('boom')):
+            result = first.install(rb.dumps_profile(complete_profile()), confirmed=True)
+        self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
+        self.assertTrue(os.path.exists(first.journal_path))
+        del first
+        second = self.writer()
+        self.assertTrue(second.uncertain)
+        blocked = second.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
+        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
+        state = second.recheck()
+        self.assertTrue(state['formal_valid'])
+        self.assertTrue(state['released'])
+        self.assertFalse(os.path.exists(second.journal_path))
+        committed = second.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
+        self.assertEqual(committed['state'], rb.COMMITTED)
+
+    def test_force_does_not_bypass_recovery(self):
+        first = self.writer()
+        with mock.patch.object(rb, '_fsync_dir', side_effect=OSError('boom')):
+            first.install(rb.dumps_profile(complete_profile()), confirmed=True)
+        second = self.writer()
+        blocked = second.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
+        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
+
+    def test_recheck_keeps_the_block_when_state_is_unconfirmable(self):
+        writer = self.writer()
+        writer.mark_uncertain('simulated crash before any durable state')
+        state = writer.recheck()
+        self.assertFalse(state['recoverable'])
+        self.assertFalse(state['released'])
+        self.assertTrue(state['uncertain'])
+
+
+# ------------------------------------------ protected-file safety (P1-6) ------
+
+class ProtectedFileSafetyTests(BenchBase):
+    def writer(self, name='resource-profile.json'):
+        return rb.ProfileWriter(os.path.join(self.dir, name))
+
+    def test_new_formal_is_created_with_strict_permissions(self):
+        writer = self.writer()
+        writer.install(rb.dumps_profile(complete_profile()), confirmed=True)
+        self.assertEqual(os.stat(writer.path).st_mode & 0o777, 0o600)
+
+    def test_read_refuses_to_follow_a_symlink(self):
+        target = os.path.join(self.dir, 'real.json')
+        Path(target).write_bytes(rb.dumps_profile(complete_profile()))
+        link = os.path.join(self.dir, 'link.json')
+        os.symlink(target, link)
+        raw, reason = rb.ProfileWriter._read_file(link)
+        self.assertIsNone(raw)
+        self.assertIn('symbolic', reason)
+
+    def test_install_aborts_on_a_symlinked_formal(self):
+        target = os.path.join(self.dir, 'real.json')
+        keep = rb.dumps_profile(complete_profile(reserve=2048))
+        Path(target).write_bytes(keep)
+        writer = self.writer()
+        os.symlink(target, writer.path)
+        result = writer.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
+        self.assertEqual(result['state'], rb.ABORTED)
+        with open(target, 'rb') as handle:
+            self.assertEqual(handle.read(), keep)
+
+    def test_install_aborts_on_a_symlinked_backup(self):
+        writer = self.writer()
+        writer.install(rb.dumps_profile(complete_profile(reserve=1024)), confirmed=True)
+        os.symlink(os.path.join(self.dir, 'elsewhere.json'), writer.backup_path)
+        result = writer.install(rb.dumps_profile(complete_profile(reserve=2048)), force=True, confirmed=True)
+        self.assertEqual(result['state'], rb.ABORTED)
+
+    def test_world_writable_parent_directory_is_rejected(self):
+        unsafe = os.path.join(self.dir, 'open')
+        os.mkdir(unsafe)
+        os.chmod(unsafe, 0o777)
+        writer = rb.ProfileWriter(os.path.join(unsafe, 'resource-profile.json'))
+        result = writer.install(rb.dumps_profile(complete_profile()), confirmed=True)
+        self.assertEqual(result['state'], rb.ABORTED)
+
+    def test_invalid_formal_is_not_reused_as_backup(self):
+        writer = self.writer()
+        Path(writer.path).write_bytes(b'not a profile')
+        result = writer.install(rb.dumps_profile(complete_profile()), confirmed=True)
+        self.assertEqual(result['state'], rb.COMMITTED)
+        self.assertFalse(result['backup_written'])
+        self.assertFalse(os.path.exists(writer.backup_path))
+
+    def test_recheck_treats_an_invalid_formal_as_invalid(self):
+        writer = self.writer()
+        Path(writer.path).write_bytes(b'not a profile')
+        state = writer.recheck()
+        self.assertFalse(state['formal_valid'])
+        self.assertFalse(state['backup_valid'])
+
+
+# ------------------------------------------- optimized-mode safety (-O) -------
+
+class OptimizedModeSafetyTests(BenchBase):
+    def test_writer_safety_survives_optimized_mode(self):
+        code = (
+            "import os, tempfile\n"
+            "import resource_benchmark as rb\n"
+            "d = tempfile.mkdtemp()\n"
+            "p = os.path.join(d, 'resource-profile.json')\n"
+            "w = rb.ProfileWriter(p)\n"
+            "if w.candidate_conflict(p) is None:\n"
+            "    raise SystemExit('FAIL: candidate conflict not detected')\n"
+            "result = w.install(b'{}', confirmed=True)\n"
+            "if result['state'] != rb.ABORTED:\n"
+            "    raise SystemExit('FAIL: incomplete candidate accepted')\n"
+            "print('PASS')\n"
+        )
+        proc = subprocess.run([sys.executable, '-O', '-c', code], cwd=REPO,
+                              capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn('PASS', proc.stdout)
 

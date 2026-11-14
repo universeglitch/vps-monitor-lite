@@ -32,10 +32,13 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -60,6 +63,7 @@ DISCOUNT_MAX = 0.5        # rejection ceiling for the available lower-tail disco
 RAM_LIMIT = 200_000_000   # decimal hardware ceiling already inside Memory.sample()
 MAX_PROFILE_BYTES = 1 << 20
 DEFAULT_PROFILE_PATH = '/etc/node-panel/resource-profile.json'
+UNCERTAIN_SUFFIX = '.uncertain'   # persisted COMMIT_UNCERTAIN marker next to the profile
 DEFAULT_SCOPE_SLICE = 'system.slice'
 CONTROLLER_REQUIRED = 'memory'
 DEFAULT_TIMEOUT = 120
@@ -122,6 +126,15 @@ class Rejected(BenchmarkError):
 
 class UncertainWrite(BenchmarkError):
     """A rename completed but its durability could not be proven (fsync failed)."""
+
+
+class OperationFailed(BenchmarkError):
+    """A recorded operation ran but did not complete successfully.
+
+    A non-zero exit status, a timeout or a launch failure must never be
+    accepted as a valid measurement sample, so the fixture that produced it
+    raises instead of returning a value the caller could ignore.
+    """
 
 
 # ------------------------------------------------------------- small helpers --
@@ -351,23 +364,24 @@ def read_envelope(source, rel_path=None):
 def _level_statuses_known(level):
     """True when a level's limit interfaces are readable (or truly unlimited).
 
-    A leaf cgroup legitimately has no ``cgroup.subtree_control``; ``absent`` is
-    therefore accepted, but ``permission``/``error`` are not (an unreadable
-    interface can never be treated as "no limit").
+    An unreadable ``memory.high``/``memory.swap.max`` can never be interpreted
+    as "no limit". Subtree-controller readability is judged separately by
+    :func:`_controller_chain`, which knows whether a level is a genuine leaf.
     """
     return (level['high_status'] in ('ok', 'unlimited') and
-            level['swap_max_status'] in ('ok', 'unlimited') and
-            level['subtree_status'] in ('ok', 'absent'))
+            level['swap_max_status'] in ('ok', 'unlimited'))
 
 
 def _controller_chain(env):
     """Return ``(indeterminate, reasons)`` for controller availability/enabling.
 
     The memory controller must be *available* to the namespace and *enabled*
-    (``cgroup.subtree_control``) by every ancestor that has children. The
-    namespace mount root's own subtree control is governed outside the
-    namespace, so it is not judged here; the leaf's absence of a subtree
-    control file just means it has no children.
+    (``cgroup.subtree_control``) by every ancestor that has children. Only a
+    genuine leaf — and the namespace mount root, whose subtree control is
+    governed outside the namespace — may expose no ``cgroup.subtree_control``.
+    A middle ancestor that must enable the controller downward but exposes no
+    (or an unreadable) interface can never be proven enabled and is therefore
+    INDETERMINATE, regardless of whether the numeric limits happen to match.
     """
     ctl = env.get('controllers') or {}
     if ctl.get('controllers_status') != 'ok':
@@ -376,12 +390,25 @@ def _controller_chain(env):
     if CONTROLLER_REQUIRED not in ctl.get('controllers', []):
         reasons.append('memory controller is not available to the namespace')
     levels = env.get('levels') or []
-    for level in levels[:-1]:  # everything but the namespace mount root
+    last = len(levels) - 1
+    for index, level in enumerate(levels):
+        is_leaf = index == 0
+        is_mount_root = index == last and last != 0
+        if is_mount_root:
+            continue
         status = level.get('subtree_status')
         if status in ('permission', 'error'):
             return True, []
-        if status == 'ok' and CONTROLLER_REQUIRED not in level.get('subtree', []):
-            reasons.append('level %s does not enable the memory controller' % level.get('path'))
+        if status == 'ok':
+            if not is_leaf and CONTROLLER_REQUIRED not in level.get('subtree', []):
+                reasons.append('level %s does not enable the memory controller' % level.get('path'))
+        elif status == 'absent':
+            if not is_leaf:
+                # A middle ancestor has children; without its subtree control we
+                # cannot prove the memory controller is enabled downward.
+                return True, []
+        else:
+            return True, []
     return False, reasons
 
 
@@ -602,24 +629,44 @@ def rejection_reasons(constants):
 
 # ------------------------------------------------------- measurement scope ----
 
+def _cleanup_fixture(fixture, prepared):
+    """Release a fixture after measurement; return an issue string or ``None``.
+
+    Cleanup must never be silent: a failure to remove the temporary auth vault
+    is reported so it can be surfaced in the run report. Only the fixture's own
+    freshly created state is ever removed, never pre-existing user data.
+    """
+    if fixture is None or not hasattr(fixture, 'cleanup'):
+        return None
+    try:
+        fixture.cleanup(prepared)
+    except Exception as exc:  # noqa: BLE001 - report, never hide
+        return 'fixture cleanup failed: ' + type(exc).__name__ + ': ' + str(exc)
+    return None
+
+
 def run_scope_operation(op, source=None, capabilities=None):
     """Execute one operation inside the current (scope) cgroup and measure it.
 
     This runs in the control process that systemd already placed inside the
-    scope unit. It records ``pre_current``, captures the scope's own limit
-    envelope, optionally resets the peak (a precision aid only), runs the
-    operation, then records ``final_peak`` and the increment
-    ``max(final_peak - pre_current, 0)``. The scope's peak is only trustworthy
-    while this process is alive, which is why it stays up until the parent
-    acknowledges the RESULT line.
+    scope unit. The measurement window is deliberately narrow: the fixture is
+    created and fully prepared first, then the peak is (best-effort) reset, then
+    ``pre_current`` is read, then the operation runs, then ``final_peak`` is
+    read. Fixture preparation cost is therefore never charged to the operation,
+    and the increment is ``max(final_peak - pre_current, 0)``. Cleanup happens
+    only after the final peak has been captured. The scope's peak is only
+    trustworthy while this process is alive, which is why it stays up until the
+    parent acknowledges the RESULT line.
     """
     src = source if source is not None else rp.Source('/')
+
+    # A trustworthy counter is a precondition, not a measurement step.
     try:
-        before = read_self_memory(src)
+        probe = read_self_memory(src)
     except rp.ProbeError as exc:
         return {'op': op, 'status': STATUS_BLOCKED, 'reason': 'scope cgroup unreadable: ' + str(exc)}
-    if before['peak_status'] != 'ok':
-        return {'op': op, 'status': STATUS_BLOCKED, 'reason': 'memory.peak ' + before['peak_status']}
+    if probe['peak_status'] != 'ok':
+        return {'op': op, 'status': STATUS_BLOCKED, 'reason': 'memory.peak ' + probe['peak_status']}
     try:
         scope_envelope = read_envelope(src)
     except rp.ProbeError as exc:
@@ -627,37 +674,83 @@ def run_scope_operation(op, source=None, capabilities=None):
         envelope_issue = str(exc)
     else:
         envelope_issue = None
-    reset = try_reset_peak(src, before['dir'])
-    if reset == 'applied':
+
+    # Build and fully prepare the fixture *outside* the measurement window so a
+    # fresh, isolated initial state is ready before ``pre_current`` is read.
+    fixture = None
+    prepared = None
+    if op != IDLE_OP:
         try:
-            before = read_self_memory(src)
-        except rp.ProbeError as exc:
-            return {'op': op, 'status': STATUS_BLOCKED, 'reason': 'post-reset cgroup unreadable: ' + str(exc)}
+            fixture = build_fixture(op, capabilities if capabilities is not None else default_capabilities())
+            prepared = fixture.prepare()
+        except Blocked as exc:
+            cleanup_issue = _cleanup_fixture(fixture, prepared)
+            return {'op': op, 'status': STATUS_BLOCKED, 'reason': str(exc),
+                    'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                    'cleanup_issue': cleanup_issue}
+        except Exception as exc:
+            cleanup_issue = _cleanup_fixture(fixture, prepared)
+            return {'op': op, 'status': STATUS_ERROR, 'reason': type(exc).__name__ + ': ' + str(exc),
+                    'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                    'cleanup_issue': cleanup_issue}
+
+    # Precision aid only: clear the high-water mark left by preparation.
+    reset = try_reset_peak(src, probe['dir'])
+    try:
+        before = read_self_memory(src)
+    except rp.ProbeError as exc:
+        cleanup_issue = _cleanup_fixture(fixture, prepared)
+        return {'op': op, 'status': STATUS_BLOCKED, 'reason': 'pre-operation cgroup unreadable: ' + str(exc),
+                'reset': reset, 'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                'cleanup_issue': cleanup_issue}
+    if before['peak_status'] != 'ok':
+        cleanup_issue = _cleanup_fixture(fixture, prepared)
+        return {'op': op, 'status': STATUS_BLOCKED, 'reason': 'memory.peak ' + before['peak_status'],
+                'reset': reset, 'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                'cleanup_issue': cleanup_issue}
+
+    # Run the target operation and judge its real outcome.
     if op == IDLE_OP:
         time.sleep(IDLE_WINDOW)
     else:
         try:
-            fixture = build_fixture(op, capabilities if capabilities is not None else default_capabilities())
-            prepared = fixture.prepare()
-            fixture.invoke(prepared)
+            outcome = fixture.invoke(prepared)
         except Blocked as exc:
+            cleanup_issue = _cleanup_fixture(fixture, prepared)
             return {'op': op, 'status': STATUS_BLOCKED, 'reason': str(exc), 'reset': reset,
-                    'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue}
-        except Exception as exc:  # the operation ran and failed: still a measurement
+                    'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                    'cleanup_issue': cleanup_issue}
+        except Exception as exc:  # the operation ran and failed: not a valid sample
+            cleanup_issue = _cleanup_fixture(fixture, prepared)
             return {'op': op, 'status': STATUS_ERROR, 'reason': type(exc).__name__ + ': ' + str(exc),
-                    'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue}
+                    'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                    'cleanup_issue': cleanup_issue}
+        if outcome not in (None, 0):  # a fixture that reports a non-zero status
+            cleanup_issue = _cleanup_fixture(fixture, prepared)
+            return {'op': op, 'status': STATUS_ERROR,
+                    'reason': op + ' reported a non-zero outcome: ' + repr(outcome),
+                    'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                    'cleanup_issue': cleanup_issue}
+
+    # Capture the final peak *before* cleanup so teardown is never measured.
     try:
         after = read_self_memory(src)
     except rp.ProbeError as exc:
+        cleanup_issue = _cleanup_fixture(fixture, prepared)
         return {'op': op, 'status': STATUS_BLOCKED, 'reason': 'post-operation cgroup unreadable: ' + str(exc),
-                'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue}
+                'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                'cleanup_issue': cleanup_issue}
     if after['peak_status'] != 'ok':
+        cleanup_issue = _cleanup_fixture(fixture, prepared)
         return {'op': op, 'status': STATUS_BLOCKED, 'reason': 'memory.peak ' + after['peak_status'],
-                'reset': reset, 'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue}
-    return {'op': op, 'status': STATUS_OK,
-            'increment': compute_increment(before['current'], after['peak']),
-            'pre_current': before['current'], 'final_peak': after['peak'], 'reset': reset,
-            'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue}
+                'reset': reset, 'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                'cleanup_issue': cleanup_issue}
+    result = {'op': op, 'status': STATUS_OK,
+              'increment': compute_increment(before['current'], after['peak']),
+              'pre_current': before['current'], 'final_peak': after['peak'], 'reset': reset,
+              'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue}
+    result['cleanup_issue'] = _cleanup_fixture(fixture, prepared)
+    return result
 
 
 _RESULT_PREFIX = 'RESULT '
@@ -752,6 +845,42 @@ class RealScopeMeter:
             raise Blocked('systemd-run unavailable; no scope measurement')
         return found
 
+    @staticmethod
+    def _read_line_with_timeout(stream, timeout):
+        """Read one line with a hard timeout; return ``(line, failure)``.
+
+        ``stdout.readline()`` blocks indefinitely, so the deadline can never be
+        enforced around it. A helper thread performs the read and hands the
+        result back through a queue; on timeout the caller terminates the child.
+        """
+        outcome = queue.Queue(maxsize=1)
+
+        def reader():
+            try:
+                outcome.put((stream.readline(), None))
+            except Exception as exc:  # pragma: no cover - defensive
+                outcome.put((None, type(exc).__name__))
+
+        worker = threading.Thread(target=reader, daemon=True)
+        worker.start()
+        try:
+            return outcome.get(timeout=timeout)
+        except queue.Empty:
+            return None, 'timeout'
+
+    @staticmethod
+    def _terminate(proc):
+        """Best-effort terminate, wait for and reap a scope client process."""
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:  # noqa: BLE001 - teardown must never mask the real error
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
     def measure(self, op, fixture=None):
         if op != IDLE_OP and op not in ALL_OPS:
             raise BenchmarkError('unknown operation')
@@ -769,14 +898,21 @@ class RealScopeMeter:
         except OSError as exc:
             raise Blocked('scope launch failed: ' + type(exc).__name__) from None
         deadline = time.monotonic() + self.timeout
-        line = proc.stdout.readline()
-        if not line:
-            proc.kill()
-            raise Blocked('scope produced no measurement')
-        if time.monotonic() > deadline:
-            proc.kill()
+        line, failure = self._read_line_with_timeout(proc.stdout, self.timeout)
+        if failure == 'timeout':
+            self._terminate(proc)
             raise Blocked('scope measurement timed out')
-        result = decode_result(line)
+        if failure is not None:
+            self._terminate(proc)
+            raise Blocked('scope produced an unreadable measurement: ' + failure)
+        if not line:
+            self._terminate(proc)
+            raise Blocked('scope exited without a measurement')
+        try:
+            result = decode_result(line)
+        except BenchmarkError:
+            self._terminate(proc)
+            raise Blocked('scope produced an invalid RESULT line') from None
         # Acknowledge only after the peak was received; the scope unit stays
         # alive until the control process consumes this line.
         try:
@@ -784,7 +920,12 @@ class RealScopeMeter:
             proc.stdin.flush()
         except (BrokenPipeError, ValueError):
             pass
-        proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+        remaining = deadline - time.monotonic()
+        try:
+            proc.wait(timeout=max(1.0, remaining))
+        except subprocess.TimeoutExpired:
+            self._terminate(proc)
+            raise Blocked('scope did not exit after acknowledgement') from None
         return result
 
 
@@ -843,7 +984,10 @@ class AuthFixture:
     """Fresh, isolated auth vault for one operation sample.
 
     ``prepare`` builds a brand new vault state for every sample so a state
-    changing operation can never inherit the previous sample's mutations.
+    changing operation can never inherit the previous sample's mutations. If
+    any prerequisite step (initialize/login/export) fails, the vault and its
+    temporary root are torn down before the error propagates, so a failed
+    preparation never leaks a directory or a half-built credential store.
     """
 
     def __init__(self, op):
@@ -854,19 +998,25 @@ class AuthFixture:
         root = Path(tempfile.mkdtemp(prefix='rpb-auth-'))
         vault = auth_module.Auth(str(root), gate=_NullGate())
         prepared = {'auth': vault, 'root': root, 'token': None, 'recovery': None, 'package': None}
-        if self.op != 'initialize':
-            prepared['recovery'] = vault.initialize(PW, PW, local_authority=True)
-        if self.op in TOKEN_OPS:
-            prepared['token'] = vault.login(PW, source='127.0.0.1')
-        if self.op == 'restore':
-            prepared['package'] = vault.export_backup(prepared['token'], INDEP_PW)
+        try:
+            if self.op != 'initialize':
+                prepared['recovery'] = vault.initialize(PW, PW, local_authority=True)
+            if self.op in TOKEN_OPS:
+                prepared['token'] = vault.login(PW, source='127.0.0.1')
+            if self.op == 'restore':
+                prepared['package'] = vault.export_backup(prepared['token'], INDEP_PW)
+        except BaseException:
+            self.cleanup(prepared)
+            raise
         return prepared
 
     def cleanup(self, prepared=None):
         import shutil
         if prepared and prepared.get('root'):
-            prepared['auth'].close()
-            shutil.rmtree(str(prepared['root']), ignore_errors=True)
+            try:
+                prepared['auth'].close()
+            finally:
+                shutil.rmtree(str(prepared['root']), ignore_errors=True)
 
     def invoke(self, prepared):
         op = self.op
@@ -897,6 +1047,10 @@ class AuthFixture:
             raise Blocked('no auth fixture for ' + op)
 
 
+# Panel/module operations that require a genuinely deployed capability.
+CAPABILITY_OPS = PANEL_OPS + (MODULE_METADATA_OP,)
+
+
 class CapabilityFixture:
     """Fixture for operations that need a genuinely deployed capability.
 
@@ -904,7 +1058,8 @@ class CapabilityFixture:
     the measuring scope (``{op: {"argv": [...], "timeout": seconds}}``). With no
     specification the operation is BLOCKED; no capability and no measurement is
     ever invented to make a run pass. The command runs inside the scope, so its
-    memory is accounted to the scope's ``memory.peak``.
+    memory is accounted to the scope's ``memory.peak``. A non-zero exit status,
+    a timeout or a launch failure is a failed operation, never a valid sample.
     """
 
     def __init__(self, op, capabilities):
@@ -912,6 +1067,8 @@ class CapabilityFixture:
         self.capabilities = capabilities or {}
 
     def prepare(self):
+        if self.op not in CAPABILITY_OPS:
+            raise Blocked(self.op + ' has no capability-driven business entry point')
         spec = self.capabilities.get(self.op)
         if not isinstance(spec, dict):
             raise Blocked(self.op + ' has no provisioned capability; refusing to invent one')
@@ -924,9 +1081,21 @@ class CapabilityFixture:
         return {'argv': list(argv), 'timeout': timeout}
 
     def invoke(self, prepared):
-        return subprocess.run(prepared['argv'], stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=prepared['timeout'],
-                              check=False).returncode
+        """Run the provisioned command and reject any non-successful outcome."""
+        try:
+            completed = subprocess.run(prepared['argv'], stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, timeout=prepared['timeout'],
+                                       check=False)
+        except subprocess.TimeoutExpired:
+            raise OperationFailed(self.op + ' capability exceeded its timeout of ' +
+                                  str(prepared['timeout']) + 's') from None
+        except OSError as exc:
+            raise OperationFailed(self.op + ' capability could not be executed: ' +
+                                  type(exc).__name__) from None
+        if completed.returncode != 0:
+            raise OperationFailed(self.op + ' capability exited with status ' +
+                                  str(completed.returncode))
+        return completed.returncode
 
 
 def build_fixture(op, capabilities=None):
@@ -1020,9 +1189,11 @@ def validate_external_document(doc, local_envelope, expected_op=None):
     """Validate one external measurement document.
 
     ``verified`` requires the schema, the operator block, integrity, at least
-    N_MIN samples and a locally recomputed EQUIVALENT cgroup environment. A
-    SHA256 digest proves integrity only; it cannot prove that the environment
-    or operator identity is genuine.
+    N_MIN samples and a *locally recomputed* EQUIVALENT cgroup environment. A
+    missing local service envelope is **not** a pass: without it the local
+    environment-equivalence check cannot run, so the document is refused rather
+    than reported as verified. A SHA256 digest proves integrity only; it cannot
+    prove the operator identity or the measuring environment is genuine.
     """
     issues = []
     if not isinstance(doc, dict):
@@ -1063,11 +1234,16 @@ def validate_external_document(doc, local_envelope, expected_op=None):
         computed = environment_fingerprint(environment)
         if doc.get('fingerprint') != computed:
             issues.append('environment fingerprint mismatch')
-        if local_envelope is not None:
-            candidate = environment.get('cgroup')
-            equivalence = compare_environments(local_envelope, candidate) if isinstance(candidate, dict) else {'state': INDETERMINATE, 'reasons': ['no cgroup block']}
-            if equivalence['state'] != EQUIVALENT:
-                issues.append('external cgroup environment is not EQUIVALENT: ' + equivalence['state'])
+    # Local environment equivalence is mandatory: an external document may not
+    # be accepted just because the local side is unavailable.
+    if local_envelope is None:
+        issues.append('local service cgroup envelope is unavailable; environment equivalence cannot be verified')
+    else:
+        candidate = environment.get('cgroup') if isinstance(environment, dict) else None
+        equivalence = (compare_environments(local_envelope, candidate) if isinstance(candidate, dict)
+                       else {'state': INDETERMINATE, 'reasons': ['no cgroup block']})
+        if equivalence['state'] != EQUIVALENT:
+            issues.append('external cgroup environment is not EQUIVALENT: ' + equivalence['state'])
     integrity = doc.get('integrity')
     if not isinstance(integrity, dict) or integrity.get('algorithm') != 'sha256':
         issues.append('integrity block missing')
@@ -1089,28 +1265,38 @@ def load_external_document(raw):
 
 # ------------------------------------------------------------- profile I/O ---
 
+# Every profile field that must be integrity-protected. The fingerprint is
+# computed over exactly these fields so tampering with operations, environment,
+# generated_at, budgets, status or equivalence is always detected.
+PROFILE_PROTECTED_FIELDS = (
+    'schema_version', 'benchmark_version', 'probe_version', 'status',
+    'generated_at', 'cgroup_equivalence', 'profiles', 'reserve',
+    'available_floor', 'constants', 'operations', 'environment_fingerprint',
+    'environment', 'issues',
+)
+
+
 def profile_fingerprint(profile):
-    static = {
-        'schema_version': profile.get('schema_version'),
-        'benchmark_version': profile.get('benchmark_version'),
-        'probe_version': profile.get('probe_version'),
-        'status': profile.get('status'),
-        'cgroup_equivalence': profile.get('cgroup_equivalence'),
-        'profiles': profile.get('profiles'),
-        'reserve': profile.get('reserve'),
-        'available_floor': profile.get('available_floor'),
-        'constants': profile.get('constants'),
-        'environment_fingerprint': profile.get('environment_fingerprint'),
-    }
-    return _sha256(_canonical(static).encode('ascii'))
+    """SHA256 over every integrity-protected field of a profile.
+
+    The fingerprint must cover the complete measurement evidence, not merely the
+    top-level summary, so that any change to a protected field is caught at load
+    time instead of silently accepted.
+    """
+    protected = dict((key, profile.get(key)) for key in PROFILE_PROTECTED_FIELDS)
+    return _sha256(_canonical(protected).encode('ascii'))
 
 
 def build_profile(operations, constants, profiles, reserve, floor, env, equivalence, *, generated_at=None, issues=None):
     """Assemble a profile document from measurement results.
 
     ``status`` is ``complete`` only when every one of the 17 operations is
-    measured or externally verified, equivalence is EQUIVALENT and no rejection
-    threshold was crossed.
+    measured or externally verified, equivalence is EQUIVALENT, no rejection
+    threshold was crossed, and the worst-case concurrency check passes. The
+    feasibility gate uses the v3 formula
+    ``required = reserve + max(profiles[op] for op != 'login') + profiles['login']``
+    and refuses to report a formal profile complete when ``required`` exceeds
+    the available floor.
     """
     all_ok = all(operations.get(op, {}).get('status') == STATUS_OK for op in ALL_OPS)
     reasons = list(rejection_reasons(constants))
@@ -1120,6 +1306,18 @@ def build_profile(operations, constants, profiles, reserve, floor, env, equivale
         reasons.append('not every operation has a trustworthy measurement')
     reasons.extend(issues or [])
     status = STATUS_COMPLETE if not reasons else STATUS_INCOMPLETE
+    # A formal profile must additionally be feasible under worst-case
+    # concurrency; otherwise it may only be retained as an incomplete candidate.
+    if status == STATUS_COMPLETE:
+        if set(profiles) != set(ALL_OPS):
+            reasons.append('a complete profile must budget every operation')
+            status = STATUS_INCOMPLETE
+        else:
+            verdict = feasibility(profiles, reserve, floor)
+            if not verdict['feasible']:
+                reasons.append('worst-case feasibility fails: reserve + max(normal) + login = %d '
+                               'exceeds available_floor %d' % (verdict['required'], floor))
+                status = STATUS_INCOMPLETE
     profile = {
         'schema_version': PROFILE_SCHEMA_VERSION,
         'benchmark_version': BENCHMARK_VERSION,
@@ -1142,12 +1340,17 @@ def build_profile(operations, constants, profiles, reserve, floor, env, equivale
 
 
 def validate_profile(profile):
-    """Explicit validation that raises ``BenchmarkError``; never an assert."""
+    """Full structural and integrity validation; raises ``BenchmarkError``.
+
+    ``loads_profile`` only turns bytes into a dict and then defers entirely to
+    this function, so there is no weaker entry point that bypasses the checks.
+    The required-field set, field types, operation set, status, version and the
+    fingerprint value are all verified here. Deliberately never uses ``assert``,
+    so the checks stay effective under ``python -O``.
+    """
     if not isinstance(profile, dict):
         raise BenchmarkError('profile must be an object')
-    required = ('schema_version', 'benchmark_version', 'probe_version', 'status',
-                'cgroup_equivalence', 'profiles', 'reserve', 'available_floor', 'fingerprint')
-    for key in required:
+    for key in PROFILE_PROTECTED_FIELDS + ('fingerprint',):
         if key not in profile:
             raise BenchmarkError('profile missing ' + key)
     if profile['schema_version'] != PROFILE_SCHEMA_VERSION:
@@ -1156,9 +1359,15 @@ def validate_profile(profile):
         raise BenchmarkError('unsupported benchmark_version')
     if profile['probe_version'] != PROBE_VERSION_EXPECTED:
         raise BenchmarkError('unsupported probe_version')
-    if profile['status'] not in (STATUS_COMPLETE, STATUS_INCOMPLETE):
-        raise BenchmarkError('invalid profile status')
     status = profile['status']
+    if status not in (STATUS_COMPLETE, STATUS_INCOMPLETE):
+        raise BenchmarkError('invalid profile status')
+    generated_at = profile['generated_at']
+    if not isinstance(generated_at, str) or not generated_at.strip():
+        raise BenchmarkError('generated_at must be a non-empty timestamp string')
+    equivalence = profile['cgroup_equivalence']
+    if equivalence not in (EQUIVALENT, NOT_EQUIVALENT, INDETERMINATE):
+        raise BenchmarkError('invalid cgroup_equivalence')
     profiles = profile['profiles']
     if not isinstance(profiles, dict):
         raise BenchmarkError('profiles must be an object')
@@ -1166,11 +1375,11 @@ def validate_profile(profile):
         raise BenchmarkError('profiles must not define a normal lane budget')
     if not set(profiles) <= set(ALL_OPS):
         raise BenchmarkError('profiles contains an unknown operation')
-    if status == STATUS_COMPLETE and set(profiles) != set(ALL_OPS):
-        raise BenchmarkError('a complete profile must budget exactly the 17 operations')
     for op, value in profiles.items():
         if type(value) is not int or not 0 < value < RAM_LIMIT:
             raise BenchmarkError('invalid budget for ' + op)
+    if status == STATUS_COMPLETE and set(profiles) != set(ALL_OPS):
+        raise BenchmarkError('a complete profile must budget exactly the 17 operations')
     reserve = profile['reserve']
     floor = profile['available_floor']
     # An INCOMPLETE candidate may legitimately carry no reserve or floor yet
@@ -1184,10 +1393,50 @@ def validate_profile(profile):
         raise BenchmarkError('a complete profile requires a positive reserve')
     if status == STATUS_COMPLETE and floor <= 0:
         raise BenchmarkError('a complete profile requires a positive available_floor')
-    if not re.fullmatch(r'[0-9a-f]{64}', str(profile['fingerprint'])):
+    constants = profile['constants']
+    if not isinstance(constants, dict):
+        raise BenchmarkError('constants must be an object')
+    for key in ('comp_ratio', 'comp_margin', 'comp_reserve_margin', 'safety_discount'):
+        if key not in constants:
+            raise BenchmarkError('constants missing ' + key)
+        if type(constants[key]) not in (int, float):
+            raise BenchmarkError('constant ' + key + ' must be numeric')
+    operations = profile['operations']
+    if not isinstance(operations, dict):
+        raise BenchmarkError('operations must be an object')
+    if not set(operations) <= set(ALL_OPS):
+        raise BenchmarkError('operations contains an unknown operation')
+    for op, record in operations.items():
+        if not isinstance(record, dict):
+            raise BenchmarkError('operation record for ' + op + ' must be an object')
+        if record.get('status') not in (STATUS_OK, STATUS_BLOCKED, STATUS_ERROR):
+            raise BenchmarkError('operation ' + op + ' has an invalid status')
+        if not isinstance(record.get('samples'), list):
+            raise BenchmarkError('operation ' + op + ' samples must be a list')
+    if status == STATUS_COMPLETE:
+        if set(operations) != set(ALL_OPS):
+            raise BenchmarkError('a complete profile must record every operation')
+        if any(operations[op].get('status') != STATUS_OK for op in ALL_OPS):
+            raise BenchmarkError('a complete profile must have a measurement for every operation')
+        if equivalence != EQUIVALENT:
+            raise BenchmarkError('a complete profile requires EQUIVALENT cgroup environment')
+        verdict = feasibility(profiles, reserve, floor)
+        if not verdict['feasible']:
+            raise BenchmarkError('profile is infeasible: required %d exceeds available_floor %d'
+                                 % (verdict['required'], floor))
+    env_fp = profile['environment_fingerprint']
+    if env_fp is not None and not re.fullmatch(r'[0-9a-f]{64}', str(env_fp)):
+        raise BenchmarkError('invalid environment_fingerprint')
+    environment = profile['environment']
+    if environment is not None and not isinstance(environment, dict):
+        raise BenchmarkError('environment must be an object or null')
+    if not isinstance(profile['issues'], list):
+        raise BenchmarkError('issues must be a list')
+    fingerprint = profile['fingerprint']
+    if not re.fullmatch(r'[0-9a-f]{64}', str(fingerprint)):
         raise BenchmarkError('invalid fingerprint')
-    if status == STATUS_COMPLETE and profile['cgroup_equivalence'] != EQUIVALENT:
-        raise BenchmarkError('a complete profile requires EQUIVALENT cgroup environment')
+    if fingerprint != profile_fingerprint(profile):
+        raise BenchmarkError('profile fingerprint mismatch')
     return True
 
 
@@ -1199,6 +1448,11 @@ def dumps_profile(profile):
 
 
 def loads_profile(raw):
+    """Parse bytes into a profile and fully validate it.
+
+    Responsibilities are split cleanly: this function only decodes the bytes,
+    while every semantic and integrity rule lives in :func:`validate_profile`.
+    """
     if len(raw) > MAX_PROFILE_BYTES:
         raise BenchmarkError('profile exceeds size limit')
     try:
@@ -1206,8 +1460,6 @@ def loads_profile(raw):
     except (ValueError, UnicodeError) as exc:
         raise BenchmarkError('profile is not valid JSON') from None
     validate_profile(profile)
-    if profile.get('fingerprint') != profile_fingerprint(profile):
-        raise BenchmarkError('profile fingerprint mismatch')
     return profile
 
 
@@ -1252,35 +1504,145 @@ def _atomic_write(path, raw, mode=0o600):
         raise UncertainWrite('rename completed but directory fsync failed: ' + type(exc).__name__) from None
 
 
+# ------------------------------------------------ protected-file safety ------
+
+def _canonical_target(path):
+    """Absolute, symlink-resolved form of a path, used only for aliasing checks."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def _lstat_regular(path):
+    """Return ``(stat_result, None)`` for a regular file, else ``(None, reason)``."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None, 'absent'
+    except OSError as exc:
+        return None, 'unreadable: ' + type(exc).__name__
+    if stat.S_ISLNK(st.st_mode):
+        return None, 'symbolic link'
+    if not stat.S_ISREG(st.st_mode):
+        return None, 'not a regular file'
+    return st, None
+
+
+def _file_trust_problem(st):
+    """Reject an existing profile file whose ownership or mode is unsafe."""
+    if st.st_uid not in (0, os.geteuid()):
+        return 'file is owned by uid ' + str(st.st_uid)
+    if st.st_mode & 0o022:
+        return 'file is writable by group or others'
+    return None
+
+
+def _symlink_problem(path):
+    """Return a reason when ``path`` exists but is a symlink or non-regular file."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return 'cannot inspect: ' + type(exc).__name__
+    if stat.S_ISLNK(st.st_mode):
+        return 'path is a symbolic link'
+    if not stat.S_ISREG(st.st_mode):
+        return 'path is not a regular file'
+    return None
+
+
+def _parent_directory_problem(path):
+    """Reject a parent directory where an atomic replace would be unsafe."""
+    parent = os.path.dirname(os.path.abspath(path)) or '/'
+    try:
+        st = os.stat(parent)
+    except OSError as exc:
+        return 'parent directory unreadable: ' + type(exc).__name__
+    if not stat.S_ISDIR(st.st_mode):
+        return 'parent is not a directory'
+    if st.st_mode & 0o002 and not st.st_mode & stat.S_ISVTX:
+        return 'parent directory is world-writable without the sticky bit'
+    if st.st_mode & 0o020:
+        return 'parent directory is group-writable'
+    return None
+
+
 class ProfileWriter:
     """Atomic, recoverable commit of a formal profile plus a same-directory backup.
 
     The two files are replaced independently; they are deliberately *not*
     presented as a single atomic transaction. A formal replace that succeeded
     but whose directory fsync failed (or whose re-read did not match) puts the
-    writer into COMMIT_UNCERTAIN: success is never reported and no further write
-    is permitted until an operator rechecks both files.
+    writer into COMMIT_UNCERTAIN and persists a marker file next to the profile,
+    so the uncertain state survives the process and blocks every later write
+    until :meth:`recheck` confirms the on-disk state. ``--force`` can never skip
+    that recovery check.
     """
 
     def __init__(self, path=DEFAULT_PROFILE_PATH, backup_suffix='.bak'):
         self.path = str(path)
         self.backup_path = self.path + backup_suffix
+        self.journal_path = self.path + UNCERTAIN_SUFFIX
         self.disabled = False
-        self.uncertain = False
+        self.uncertain = self._journal_present()
 
     def candidate_path(self):
         base, ext = os.path.splitext(self.path)
         return base + '.candidate' + ext
 
+    def candidate_conflict(self, candidate_path):
+        """Return a reason when ``candidate_path`` aliases a protected file.
+
+        A candidate is written before any formal commit, so it must be proven
+        distinct from both the formal profile and its backup *before* a single
+        byte is written. Paths are canonicalised (absolute with symlinks
+        resolved), so ``./`` prefixes, aliases and symlinked parents cannot
+        smuggle the candidate onto a protected path. The check never depends on
+        a later :meth:`install` call noticing the problem.
+        """
+        candidate = _canonical_target(candidate_path)
+        if candidate == _canonical_target(self.path):
+            return 'candidate path resolves onto the formal profile path'
+        if candidate == _canonical_target(self.backup_path):
+            return 'candidate path resolves onto the backup profile path'
+        return None
+
+    def _journal_present(self):
+        try:
+            os.lstat(self.journal_path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
     @staticmethod
     def _read_file(path):
+        """Read a protected file without following a symlink; ``(raw, reason)``.
+
+        ``reason`` is ``None`` on success, otherwise a short description of why
+        the bytes cannot be trusted (absent, symbolic link, not a regular file,
+        unsafe ownership/permissions, unreadable, or changed during the read). A
+        symlink is never followed to read a profile.
+        """
+        st, reason = _lstat_regular(path)
+        if reason is not None:
+            return None, reason
+        problem = _file_trust_problem(st)
+        if problem is not None:
+            return None, problem
         try:
             with open(path, 'rb') as handle:
-                return handle.read(MAX_PROFILE_BYTES + 1)
-        except FileNotFoundError:
-            return None
-        except OSError:
-            return None
+                raw = handle.read(MAX_PROFILE_BYTES + 1)
+        except OSError as exc:
+            return None, 'unreadable: ' + type(exc).__name__
+        # Re-stat after reading to shrink the race window: a swap between the
+        # lstat and the read shows up as a changed inode or file type.
+        after, after_reason = _lstat_regular(path)
+        if after_reason is not None:
+            return None, 'changed during read (' + after_reason + ')'
+        if (after.st_dev, after.st_ino) != (st.st_dev, st.st_ino):
+            return None, 'changed during read'
+        return raw, None
 
     @staticmethod
     def _verify(raw):
@@ -1295,32 +1657,89 @@ class ProfileWriter:
     def _write_file(self, path, raw):
         _atomic_write(path, raw)
 
-    def recheck(self):
-        """Re-read both files and describe the recoverable state (no change)."""
-        formal_valid, formal, formal_issues = self._verify(self._read_file(self.path))
-        backup_valid, backup, backup_issues = self._verify(self._read_file(self.backup_path))
+    def _persist_uncertain(self, reason):
+        """Persist the COMMIT_UNCERTAIN marker so it survives this process."""
+        payload = _canonical({'reason': reason,
+                              'generated_at': _utcnow().isoformat(),
+                              'formal': os.path.abspath(self.path),
+                              'backup': os.path.abspath(self.backup_path)}).encode('ascii')
+        try:
+            _atomic_write(self.journal_path, payload)
+        except (OSError, UncertainWrite):
+            # The marker's own durability may be unprovable when the very same
+            # directory fsync is failing; a plain write still leaves it visible
+            # to the next process.
+            try:
+                with open(self.journal_path, 'wb') as handle:
+                    handle.write(payload)
+            except OSError:
+                pass
+
+    def _scan(self):
+        """Read-only view of the recoverable state of both protected files."""
+        formal_raw, formal_reason = self._read_file(self.path)
+        backup_raw, backup_reason = self._read_file(self.backup_path)
+        formal_valid, formal, formal_issues = self._verify(formal_raw)
+        backup_valid, backup, backup_issues = self._verify(backup_raw)
+        if formal_raw is None and formal_reason not in (None, 'absent'):
+            formal_issues = [formal_reason]
+        if backup_raw is None and backup_reason not in (None, 'absent'):
+            backup_issues = [backup_reason]
         return {'formal_valid': formal_valid, 'formal_issues': formal_issues,
                 'backup_valid': backup_valid, 'backup_issues': backup_issues,
                 'formal': formal, 'backup': backup,
-                'uncertain': self.uncertain}
+                'recoverable': bool(formal_valid or backup_valid),
+                'uncertain': bool(self.uncertain or self._journal_present())}
+
+    def recheck(self):
+        """Verify both protected files and release a persisted block when safe.
+
+        This is the explicit recovery checkpoint. It re-reads the formal profile
+        and its backup independently; when it can confirm a trustworthy on-disk
+        state it also clears a persisted COMMIT_UNCERTAIN marker, releasing the
+        write block. When the state cannot be confirmed the block is kept. The
+        two files are never described as a single atomic transaction.
+        """
+        state = self._scan()
+        released = False
+        if state['recoverable'] and self._journal_present():
+            try:
+                os.unlink(self.journal_path)
+                released = True
+            except OSError:
+                released = False
+        if released:
+            self.disabled = False
+            self.uncertain = False
+        else:
+            self.uncertain = self._journal_present()
+        state['released'] = released
+        state['uncertain'] = self.uncertain
+        return state
 
     def install(self, candidate_raw, *, force=False, confirmed=False):
         """Commit a candidate profile to the formal path.
 
         ``force`` only permits replacing an existing *valid* formal profile. It
-        never bypasses completeness, equivalence, threshold or confirmation
-        checks. ``confirmed`` records the required interactive confirmation.
-        A rename that succeeded without a proven directory fsync (or a re-read
-        that does not match) enters COMMIT_UNCERTAIN and poisons the writer.
+        never bypasses completeness, equivalence, feasibility, threshold,
+        confirmation or the COMMIT_UNCERTAIN recovery check. ``confirmed``
+        records the required interactive confirmation. A rename that succeeded
+        without a proven directory fsync (or a re-read that does not match)
+        enters COMMIT_UNCERTAIN, persists a marker and poisons the writer across
+        processes.
         """
-        if self.uncertain or self.disabled:
-            return {'state': COMMIT_UNCERTAIN, 'reasons': ['writer is poisoned; recheck required'],
-                    'recheck': self.recheck()}
+        # Cross-process recovery first: a persisted uncertain marker blocks every
+        # write until an explicit recheck confirms the state. This runs before
+        # ``force`` is consulted, so --force can never skip it.
+        if self.disabled or self.uncertain or self._journal_present():
+            self.disabled = True
+            self.uncertain = True
+            return {'state': COMMIT_UNCERTAIN,
+                    'reasons': ['a previous commit is uncertain; run recheck to confirm the '
+                                'formal and backup files before writing again'],
+                    'recheck': self._scan()}
         if confirmed is not True:
             return {'state': ABORTED, 'reasons': ['interactive confirmation not provided']}
-        # Gate on completeness first, so an incomplete candidate is refused for
-        # the right reason and an unmeasured budget can never reach the formal
-        # path through a schema technicality.
         try:
             candidate_obj = json.loads(candidate_raw)
         except (ValueError, UnicodeError):
@@ -1331,7 +1750,17 @@ class ProfileWriter:
         valid, profile, issues = self._verify(candidate_raw)
         if not valid:
             return {'state': ABORTED, 'reasons': ['invalid candidate: ' + '; '.join(issues)]}
-        existing_raw = self._read_file(self.path)
+        # Filesystem safety before any write: refuse to read or replace a
+        # symlinked or non-regular formal/backup file, or to write inside an
+        # unsafe parent directory.
+        for label, target in (('formal', self.path), ('backup', self.backup_path)):
+            problem = _symlink_problem(target)
+            if problem is not None:
+                return {'state': ABORTED, 'reasons': [label + ' path is unsafe: ' + problem]}
+        parent_problem = _parent_directory_problem(self.path)
+        if parent_problem is not None:
+            return {'state': ABORTED, 'reasons': ['formal parent directory is unsafe: ' + parent_problem]}
+        existing_raw, _existing_reason = self._read_file(self.path)
         existing_valid, _existing, _existing_issues = self._verify(existing_raw)
         if existing_valid and not force:
             return {'state': ABORTED, 'reasons': ['a valid formal profile exists; --force required']}
@@ -1347,17 +1776,23 @@ class ProfileWriter:
             return self.mark_uncertain('formal rename completed but its directory fsync failed')
         except OSError as exc:
             return {'state': ABORTED, 'reasons': ['formal write failed: ' + type(exc).__name__]}
-        reread = self._read_file(self.path)
+        reread, _reread_reason = self._read_file(self.path)
         if reread != candidate_raw:
             return self.mark_uncertain('formal re-read did not match the candidate bytes')
         return {'state': COMMITTED, 'reasons': [], 'fingerprint': profile['fingerprint'],
                 'backup_written': existing_valid}
 
     def mark_uncertain(self, reason):
-        """Enter COMMIT_UNCERTAIN after a post-replace durability failure."""
+        """Enter COMMIT_UNCERTAIN after a post-replace durability failure.
+
+        The state is persisted to disk so it survives the process, and the
+        writer stays poisoned for every later write until :meth:`recheck`
+        confirms the files.
+        """
         self.disabled = True
         self.uncertain = True
-        return {'state': COMMIT_UNCERTAIN, 'reasons': [reason], 'recheck': self.recheck()}
+        self._persist_uncertain(reason)
+        return {'state': COMMIT_UNCERTAIN, 'reasons': [reason], 'recheck': self._scan()}
 
 
 # --------------------------------------------------------- orchestration -----
@@ -1596,8 +2031,16 @@ def _cmd_benchmark(args):
     The three installer operations are only ever taken from validated external
     documents. A blocking condition (no ``memory.peak``, no scope, no service
     cgroup, a non-equivalent environment, an unprovisioned capability) yields an
-    INCOMPLETE profile that may only be written to the candidate path.
+    INCOMPLETE profile that may only be written to the candidate path. The
+    candidate path is proven distinct from the formal profile and its backup
+    before any write, so an incomplete candidate can never overwrite them.
     """
+    writer = ProfileWriter(args.profile)
+    candidate_path = args.candidate or writer.candidate_path()
+    conflict = writer.candidate_conflict(candidate_path)
+    if conflict is not None:
+        sys.stderr.write('candidate path refused: ' + conflict + '\n')
+        return 1
     source = rp.Source(args.root) if args.root else rp.Source('/')
     service_envelope, service_issue = None, None
     try:
@@ -1631,8 +2074,6 @@ def _cmd_benchmark(args):
     constants = compute_constants(outcome['per_op'], outcome['idle'], outcome['available'])
     profile = compose_profile(outcome, externals, constants, env, equivalence)
     candidate_raw = dumps_profile(profile)
-    writer = ProfileWriter(args.profile)
-    candidate_path = args.candidate or writer.candidate_path()
     candidate_written, candidate_issue = False, None
     try:
         _atomic_write(candidate_path, candidate_raw)
