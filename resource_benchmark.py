@@ -28,6 +28,7 @@ service. Importing it has no side effects.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
@@ -1006,17 +1007,47 @@ class AuthFixture:
             if self.op == 'restore':
                 prepared['package'] = vault.export_backup(prepared['token'], INDEP_PW)
         except BaseException:
-            self.cleanup(prepared)
+            try:
+                self.cleanup(prepared)
+            except Exception:  # noqa: BLE001 - never mask the preparation failure
+                pass
             raise
         return prepared
 
     def cleanup(self, prepared=None):
+        """Remove the fixture's own temporary vault; never hide a failure.
+
+        Only the directory this fixture created with :func:`tempfile.mkdtemp`
+        (recognised by its ``rpb-auth-`` prefix) is ever removed, never a path
+        that merely happens to be recorded in ``prepared``. A removal failure is
+        raised so the caller reports it rather than assuming the vault is gone;
+        an already-absent directory satisfies the goal and is not an error. The
+        original measurement error is never masked — :func:`run_scope_operation`
+        collects this exception through :func:`_cleanup_fixture`, which reports
+        it alongside, not instead of, the measurement outcome.
+        """
         import shutil
-        if prepared and prepared.get('root'):
+        if not prepared or not prepared.get('root'):
+            return
+        root = Path(prepared['root'])
+        close_error = None
+        try:
+            prepared['auth'].close()
+        except Exception as exc:  # noqa: BLE001 - still attempt the directory removal
+            close_error = exc
+        remove_error = None
+        if root.name.startswith('rpb-auth-'):
             try:
-                prepared['auth'].close()
-            finally:
-                shutil.rmtree(str(prepared['root']), ignore_errors=True)
+                shutil.rmtree(str(root))
+            except FileNotFoundError:
+                pass  # already gone: the goal (absence) is met
+            except OSError as exc:
+                remove_error = exc
+        if remove_error is not None:
+            raise OSError('cannot remove temporary vault ' + str(root) + ': ' +
+                          type(remove_error).__name__ + ': ' + str(remove_error)) from None
+        if close_error is not None:
+            raise close_error
 
     def invoke(self, prepared):
         op = self.op
@@ -1050,16 +1081,82 @@ class AuthFixture:
 # Panel/module operations that require a genuinely deployed capability.
 CAPABILITY_OPS = PANEL_OPS + (MODULE_METADATA_OP,)
 
+# The canonical real business entry point behind every capability-driven
+# operation. A capability specification must name exactly the entry point of the
+# operation it claims to measure: a generic program, a bare ``exit 0`` or one
+# meaningless command renamed for several operations can never stand in for a
+# genuine business operation. The command must additionally print a verifiable
+# result that identifies the operation (see :data:`CAPABILITY_RESULT_KIND`).
+CAPABILITY_ENTRYPOINTS = {
+    'qr': 'function.PanelBackend.qr',
+    'diagnostics': 'function.PanelBackend.detail',
+    'xray-test': 'function.XraySelfTest.__call__',
+    'module-metadata': 'function.PanelBackend.metadata',
+}
+
+# The only supported verifiable-result kind: the business entry must print one
+# JSON object on stdout that identifies the operation and carries the declared
+# business result fields. A bare exit status is never accepted as proof.
+CAPABILITY_RESULT_KIND = 'json'
+
+
+def _capability_result_contract_problem(contract):
+    """Return a reason when a capability result contract cannot verify anything."""
+    if not isinstance(contract, dict):
+        return 'missing'
+    if contract.get('kind') != CAPABILITY_RESULT_KIND:
+        return 'of an unsupported kind'
+    op_field = contract.get('op_field', 'operation')
+    if not isinstance(op_field, str) or not op_field:
+        return 'malformed: op_field'
+    expect = contract.get('expect')
+    if not isinstance(expect, dict) or not expect:
+        return 'malformed: expect must declare the expected business result'
+    return None
+
+
+def _verify_capability_result(op, contract, stdout):
+    """Return a reason when ``stdout`` does not prove ``op`` really ran.
+
+    The result must be a JSON object whose identity field names ``op`` and which
+    carries every declared expected business field. This binds the measurement
+    to the actual operation, so exit status alone is never accepted.
+    """
+    try:
+        doc = json.loads((stdout or b'').decode('utf-8', 'replace'))
+    except (ValueError, UnicodeError):
+        return 'did not print a JSON result'
+    if not isinstance(doc, dict):
+        return 'did not print a JSON object result'
+    op_field = contract.get('op_field', 'operation')
+    if doc.get(op_field) != op:
+        return 'result does not identify the ' + op + ' business operation'
+    for key, value in (contract.get('expect') or {}).items():
+        if doc.get(key) != value:
+            return 'result field ' + repr(key) + ' does not match the expected business output'
+    return None
+
 
 class CapabilityFixture:
     """Fixture for operations that need a genuinely deployed capability.
 
-    A capability is described by an explicit command specification supplied to
-    the measuring scope (``{op: {"argv": [...], "timeout": seconds}}``). With no
-    specification the operation is BLOCKED; no capability and no measurement is
-    ever invented to make a run pass. The command runs inside the scope, so its
-    memory is accounted to the scope's ``memory.peak``. A non-zero exit status,
-    a timeout or a launch failure is a failed operation, never a valid sample.
+    A capability is described by an explicit specification supplied to the
+    measuring scope::
+
+        {op: {"entrypoint": <real business entry>, "argv": [...],
+              "timeout": seconds,
+              "result": {"kind": "json", "op_field": "operation",
+                         "expect": {"ok": true, ...}}}}
+
+    ``entrypoint`` must name the operation's real business entry point (see
+    :data:`CAPABILITY_ENTRYPOINTS`) and ``result`` must declare a verifiable
+    result contract. With no specification — or with one that names no real
+    entry point, no verifiable result, an empty command or any other placeholder
+    — the operation is BLOCKED; no capability and no measurement is ever invented
+    to make a run pass. The command runs inside the scope, so its memory is
+    accounted to the scope's ``memory.peak``. A non-zero exit status, a timeout,
+    a launch failure or a result that does not prove the business operation ran
+    is a failed operation, never a valid sample.
     """
 
     def __init__(self, op, capabilities):
@@ -1072,18 +1169,30 @@ class CapabilityFixture:
         spec = self.capabilities.get(self.op)
         if not isinstance(spec, dict):
             raise Blocked(self.op + ' has no provisioned capability; refusing to invent one')
+        expected = CAPABILITY_ENTRYPOINTS.get(self.op)
+        if spec.get('entrypoint') != expected:
+            raise Blocked(self.op + ' capability does not name its real business entry point ' +
+                          repr(expected))
         argv = spec.get('argv')
         if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
             raise Blocked(self.op + ' capability argv is missing or malformed')
         timeout = spec.get('timeout', 60)
         if type(timeout) is not int or timeout <= 0:
             raise Blocked(self.op + ' capability timeout is malformed')
-        return {'argv': list(argv), 'timeout': timeout}
+        problem = _capability_result_contract_problem(spec.get('result'))
+        if problem is not None:
+            raise Blocked(self.op + ' capability result contract is ' + problem)
+        return {'argv': list(argv), 'timeout': timeout, 'result': dict(spec['result'])}
 
     def invoke(self, prepared):
-        """Run the provisioned command and reject any non-successful outcome."""
+        """Run the provisioned command and reject any non-successful outcome.
+
+        The exit status must be zero *and* the printed result must prove the
+        declared business operation actually ran; a plain ``exit 0`` command is
+        therefore never accepted as a valid sample.
+        """
         try:
-            completed = subprocess.run(prepared['argv'], stdout=subprocess.DEVNULL,
+            completed = subprocess.run(prepared['argv'], stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, timeout=prepared['timeout'],
                                        check=False)
         except subprocess.TimeoutExpired:
@@ -1095,6 +1204,10 @@ class CapabilityFixture:
         if completed.returncode != 0:
             raise OperationFailed(self.op + ' capability exited with status ' +
                                   str(completed.returncode))
+        problem = _verify_capability_result(self.op, prepared['result'], completed.stdout)
+        if problem is not None:
+            raise OperationFailed(self.op + ' capability did not prove the business operation ran: ' +
+                                  problem)
         return completed.returncode
 
 
@@ -1313,11 +1426,16 @@ def build_profile(operations, constants, profiles, reserve, floor, env, equivale
             reasons.append('a complete profile must budget every operation')
             status = STATUS_INCOMPLETE
         else:
-            verdict = feasibility(profiles, reserve, floor)
-            if not verdict['feasible']:
-                reasons.append('worst-case feasibility fails: reserve + max(normal) + login = %d '
-                               'exceeds available_floor %d' % (verdict['required'], floor))
+            records_problem = _complete_records_problem(operations)
+            if records_problem is not None:
+                reasons.append(records_problem)
                 status = STATUS_INCOMPLETE
+            else:
+                verdict = feasibility(profiles, reserve, floor)
+                if not verdict['feasible']:
+                    reasons.append('worst-case feasibility fails: reserve + max(normal) + login = %d '
+                                   'exceeds available_floor %d' % (verdict['required'], floor))
+                    status = STATUS_INCOMPLETE
     profile = {
         'schema_version': PROFILE_SCHEMA_VERSION,
         'benchmark_version': BENCHMARK_VERSION,
@@ -1337,6 +1455,42 @@ def build_profile(operations, constants, profiles, reserve, floor, env, equivale
     }
     profile['fingerprint'] = profile_fingerprint(profile)
     return profile
+
+
+def _sample_values_problem(samples):
+    """Return a reason when ``samples`` is not a list of non-negative integers.
+
+    ``bool`` is deliberately rejected: ``type(True) is bool``, never ``int``, so
+    a boolean can never masquerade as a byte-count sample.
+    """
+    if not isinstance(samples, list):
+        return 'must be a list'
+    for value in samples:
+        if type(value) is not int or value < 0:
+            return 'must contain only non-negative integers'
+    return None
+
+
+def _complete_records_problem(operations):
+    """Return a reason when records cannot support a formal (complete) profile.
+
+    A formal profile requires every operation to be measured (``ok``) with at
+    least :data:`N_MIN` valid samples. This is enforced at generation time as
+    well as at load/write time, so no entry point can emit a formal profile that
+    carries a single sample per operation.
+    """
+    for op in ALL_OPS:
+        record = operations.get(op)
+        if not isinstance(record, dict) or record.get('status') != STATUS_OK:
+            return 'operation ' + op + ' has no trustworthy measurement'
+        samples = record.get('samples')
+        problem = _sample_values_problem(samples)
+        if problem is not None:
+            return 'operation ' + op + ' samples ' + problem
+        if len(samples) < N_MIN:
+            return ('operation ' + op + ' has fewer than %d valid samples, so the profile '
+                    'cannot be complete' % N_MIN)
+    return None
 
 
 def validate_profile(profile):
@@ -1411,13 +1565,20 @@ def validate_profile(profile):
             raise BenchmarkError('operation record for ' + op + ' must be an object')
         if record.get('status') not in (STATUS_OK, STATUS_BLOCKED, STATUS_ERROR):
             raise BenchmarkError('operation ' + op + ' has an invalid status')
-        if not isinstance(record.get('samples'), list):
-            raise BenchmarkError('operation ' + op + ' samples must be a list')
+        problem = _sample_values_problem(record.get('samples'))
+        if problem is not None:
+            raise BenchmarkError('operation ' + op + ' samples ' + problem)
     if status == STATUS_COMPLETE:
         if set(operations) != set(ALL_OPS):
             raise BenchmarkError('a complete profile must record every operation')
         if any(operations[op].get('status') != STATUS_OK for op in ALL_OPS):
             raise BenchmarkError('a complete profile must have a measurement for every operation')
+        # A formal profile needs at least N_MIN valid samples per operation; a
+        # single sample can never be promoted to complete.
+        for op in ALL_OPS:
+            if len(operations[op]['samples']) < N_MIN:
+                raise BenchmarkError('a complete profile requires at least %d valid samples for %s'
+                                     % (N_MIN, op))
         if equivalence != EQUIVALENT:
             raise BenchmarkError('a complete profile requires EQUIVALENT cgroup environment')
         verdict = feasibility(profiles, reserve, floor)
@@ -1511,19 +1672,17 @@ def _canonical_target(path):
     return os.path.realpath(os.path.abspath(path))
 
 
-def _lstat_regular(path):
-    """Return ``(stat_result, None)`` for a regular file, else ``(None, reason)``."""
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return None, 'absent'
-    except OSError as exc:
-        return None, 'unreadable: ' + type(exc).__name__
-    if stat.S_ISLNK(st.st_mode):
-        return None, 'symbolic link'
-    if not stat.S_ISREG(st.st_mode):
-        return None, 'not a regular file'
-    return st, None
+def _read_fd(fd, limit):
+    """Read at most ``limit`` bytes from an already-verified descriptor."""
+    chunks = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 1 << 16))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks)
 
 
 def _file_trust_problem(st):
@@ -1551,7 +1710,12 @@ def _symlink_problem(path):
 
 
 def _parent_directory_problem(path):
-    """Reject a parent directory where an atomic replace would be unsafe."""
+    """Reject a parent directory where an atomic replace would be unsafe.
+
+    The directory's type, owner and mode are all verified: a non-directory, a
+    directory owned by neither root nor this process, or one that is group- or
+    world-writable (without the sticky bit) can never host a protected file.
+    """
     parent = os.path.dirname(os.path.abspath(path)) or '/'
     try:
         st = os.stat(parent)
@@ -1559,6 +1723,8 @@ def _parent_directory_problem(path):
         return 'parent directory unreadable: ' + type(exc).__name__
     if not stat.S_ISDIR(st.st_mode):
         return 'parent is not a directory'
+    if st.st_uid not in (0, os.geteuid()):
+        return 'parent directory is owned by uid ' + str(st.st_uid)
     if st.st_mode & 0o002 and not st.st_mode & stat.S_ISVTX:
         return 'parent directory is world-writable without the sticky bit'
     if st.st_mode & 0o020:
@@ -1606,41 +1772,102 @@ class ProfileWriter:
             return 'candidate path resolves onto the backup profile path'
         return None
 
-    def _journal_present(self):
+    def _journal_status(self):
+        """Classify the persisted marker as ``'absent'``, ``'ok'`` or a reason.
+
+        Fail-closed: a marker that exists but cannot be read, is not a regular
+        file or cannot be parsed is never treated as absent. Only an ``'ok'``
+        marker may ever release the write block (see :meth:`recheck`); anything
+        else keeps every write blocked.
+        """
         try:
-            os.lstat(self.journal_path)
+            st = os.lstat(self.journal_path)
         except FileNotFoundError:
-            return False
-        except OSError:
-            return True
-        return True
+            return 'absent'
+        except OSError as exc:
+            return 'unreadable: ' + type(exc).__name__
+        if not stat.S_ISREG(st.st_mode):
+            return 'not a regular file'
+        try:
+            with open(self.journal_path, 'rb') as handle:
+                raw = handle.read(MAX_PROFILE_BYTES + 1)
+        except OSError as exc:
+            return 'unreadable: ' + type(exc).__name__
+        try:
+            doc = json.loads(raw)
+        except (ValueError, UnicodeError):
+            return 'corrupt'
+        if not isinstance(doc, dict) or 'reason' not in doc:
+            return 'corrupt'
+        return 'ok'
+
+    def _journal_present(self):
+        """True when any marker exists; an unreadable/corrupt marker still counts."""
+        return self._journal_status() != 'absent'
 
     @staticmethod
     def _read_file(path):
-        """Read a protected file without following a symlink; ``(raw, reason)``.
+        """Read a protected file through a verified descriptor; ``(raw, reason)``.
 
-        ``reason`` is ``None`` on success, otherwise a short description of why
-        the bytes cannot be trusted (absent, symbolic link, not a regular file,
-        unsafe ownership/permissions, unreadable, or changed during the read). A
-        symlink is never followed to read a profile.
+        The file is opened with ``O_NOFOLLOW`` and then judged by its *descriptor*
+        (``os.fstat``), not merely by a path-based ``lstat``: the device and inode
+        of the descriptor are confirmed to match the path, the descriptor must be
+        a regular file, and its ownership and mode must be trustworthy. The bytes
+        are read from that same verified descriptor, and the path is inspected
+        once more afterwards so a replacement during the read is detected. The
+        parent directory's type, owner and mode are verified first. ``reason`` is
+        ``None`` on success, otherwise a short description of why the bytes
+        cannot be trusted. A symlink is never followed, and the descriptor is
+        always closed, including on every error path.
         """
-        st, reason = _lstat_regular(path)
-        if reason is not None:
-            return None, reason
-        problem = _file_trust_problem(st)
-        if problem is not None:
-            return None, problem
+        parent_problem = _parent_directory_problem(path)
+        if parent_problem is not None:
+            return None, parent_problem
         try:
-            with open(path, 'rb') as handle:
-                raw = handle.read(MAX_PROFILE_BYTES + 1)
+            pre = os.lstat(path)
+        except FileNotFoundError:
+            return None, 'absent'
         except OSError as exc:
             return None, 'unreadable: ' + type(exc).__name__
-        # Re-stat after reading to shrink the race window: a swap between the
-        # lstat and the read shows up as a changed inode or file type.
-        after, after_reason = _lstat_regular(path)
-        if after_reason is not None:
-            return None, 'changed during read (' + after_reason + ')'
-        if (after.st_dev, after.st_ino) != (st.st_dev, st.st_ino):
+        if stat.S_ISLNK(pre.st_mode):
+            return None, 'symbolic link'
+        if not stat.S_ISREG(pre.st_mode):
+            return None, 'not a regular file'
+        flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return None, 'absent'
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                return None, 'symbolic link'
+            return None, 'unreadable: ' + type(exc).__name__
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None, 'not a regular file'
+            problem = _file_trust_problem(st)
+            if problem is not None:
+                return None, problem
+            # The opened descriptor must be the very file the path names; a swap
+            # between the lstat and the open shows up as a differing inode/device.
+            if (st.st_dev, st.st_ino) != (pre.st_dev, pre.st_ino):
+                return None, 'changed during open'
+            try:
+                raw = _read_fd(fd, MAX_PROFILE_BYTES + 1)
+            except OSError as exc:
+                return None, 'unreadable: ' + type(exc).__name__
+        finally:
+            os.close(fd)
+        # Re-inspect the path after reading from the verified descriptor so a
+        # replacement during the read is caught.
+        try:
+            post = os.lstat(path)
+        except FileNotFoundError:
+            return None, 'changed during read (absent)'
+        except OSError as exc:
+            return None, 'changed during read (' + type(exc).__name__ + ')'
+        if (post.st_dev, post.st_ino) != (st.st_dev, st.st_ino):
             return None, 'changed during read'
         return raw, None
 
@@ -1658,22 +1885,42 @@ class ProfileWriter:
         _atomic_write(path, raw)
 
     def _persist_uncertain(self, reason):
-        """Persist the COMMIT_UNCERTAIN marker so it survives this process."""
+        """Persist the COMMIT_UNCERTAIN marker; never pretend it succeeded.
+
+        Returns ``(persisted, detail)``. A failure to make the marker durable is
+        reported, never swallowed: the in-memory block still holds for this
+        process, and the caller can see that the cross-process marker could not
+        be created. The marker is confirmed to exist as a regular file before the
+        write is considered a success.
+        """
         payload = _canonical({'reason': reason,
                               'generated_at': _utcnow().isoformat(),
                               'formal': os.path.abspath(self.path),
                               'backup': os.path.abspath(self.backup_path)}).encode('ascii')
         try:
             _atomic_write(self.journal_path, payload)
-        except (OSError, UncertainWrite):
-            # The marker's own durability may be unprovable when the very same
-            # directory fsync is failing; a plain write still leaves it visible
-            # to the next process.
+        except UncertainWrite:
+            # The rename already made the marker visible; the durability of the
+            # rename is unprovable, but the next process can still see it. Verified
+            # below.
+            pass
+        except OSError:
+            # The marker's own durable replace failed (e.g. the same directory
+            # fsync is failing); fall back to a plain, visible write.
             try:
                 with open(self.journal_path, 'wb') as handle:
                     handle.write(payload)
-            except OSError:
-                pass
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                return False, type(exc).__name__ + ': ' + str(exc)
+        try:
+            st = os.lstat(self.journal_path)
+        except OSError as exc:
+            return False, 'marker not visible: ' + type(exc).__name__
+        if not stat.S_ISREG(st.st_mode):
+            return False, 'marker is not a regular file'
+        return True, None
 
     def _scan(self):
         """Read-only view of the recoverable state of both protected files."""
@@ -1695,14 +1942,17 @@ class ProfileWriter:
         """Verify both protected files and release a persisted block when safe.
 
         This is the explicit recovery checkpoint. It re-reads the formal profile
-        and its backup independently; when it can confirm a trustworthy on-disk
-        state it also clears a persisted COMMIT_UNCERTAIN marker, releasing the
-        write block. When the state cannot be confirmed the block is kept. The
-        two files are never described as a single atomic transaction.
+        and its backup independently; only when it can confirm a trustworthy
+        on-disk state *and* the persisted marker is well-formed does it clear the
+        marker and release the write block. A missing, unreadable or corrupt
+        marker, or a formal/backup pair that cannot be confirmed, keeps the block
+        (fail-closed). The two files are never described as a single atomic
+        transaction.
         """
         state = self._scan()
+        status = self._journal_status()
         released = False
-        if state['recoverable'] and self._journal_present():
+        if status == 'ok' and state['recoverable']:
             try:
                 os.unlink(self.journal_path)
                 released = True
@@ -1715,6 +1965,7 @@ class ProfileWriter:
             self.uncertain = self._journal_present()
         state['released'] = released
         state['uncertain'] = self.uncertain
+        state['marker'] = status
         return state
 
     def install(self, candidate_raw, *, force=False, confirmed=False):
@@ -1787,12 +2038,19 @@ class ProfileWriter:
 
         The state is persisted to disk so it survives the process, and the
         writer stays poisoned for every later write until :meth:`recheck`
-        confirms the files.
+        confirms the files. If the marker itself cannot be made durable the
+        outcome stays COMMIT_UNCERTAIN (never a success) and the failure is
+        reported, so a broken marker is never mistaken for a safe state.
         """
         self.disabled = True
         self.uncertain = True
-        self._persist_uncertain(reason)
-        return {'state': COMMIT_UNCERTAIN, 'reasons': [reason], 'recheck': self._scan()}
+        persisted, detail = self._persist_uncertain(reason)
+        result = {'state': COMMIT_UNCERTAIN, 'reasons': [reason],
+                  'recheck': self._scan(), 'marker_persisted': persisted}
+        if not persisted:
+            result['reasons'].append('the COMMIT_UNCERTAIN marker could not be persisted (' +
+                                     str(detail) + '); this process still refuses every further write')
+        return result
 
 
 # --------------------------------------------------------- orchestration -----
