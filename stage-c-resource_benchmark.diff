@@ -1,0 +1,811 @@
+diff --git a/resource_benchmark.py b/resource_benchmark.py
+index e5a7910..df524dd 100644
+--- a/resource_benchmark.py
++++ b/resource_benchmark.py
+@@ -642,10 +642,23 @@ def _cleanup_fixture(fixture, prepared):
+     try:
+         fixture.cleanup(prepared)
+     except Exception as exc:  # noqa: BLE001 - report, never hide
+-        return 'fixture cleanup failed: ' + type(exc).__name__ + ': ' + str(exc)
++        return 'fixture cleanup failed: ' + _describe_exception(exc)
+     return None
+ 
+ 
++def _describe_exception(exc):
++    """Render an exception with its notes, so a chained failure is not lost.
++
++    A preparation error can carry an attached cleanup failure as a note; folding
++    the notes into the message keeps both visible in the run report rather than
++    only in a traceback.
++    """
++    text = type(exc).__name__ + ': ' + str(exc)
++    for note in getattr(exc, '__notes__', ()) or ():
++        text += ' [' + str(note) + ']'
++    return text
++
++
+ def run_scope_operation(op, source=None, capabilities=None):
+     """Execute one operation inside the current (scope) cgroup and measure it.
+ 
+@@ -691,7 +704,7 @@ def run_scope_operation(op, source=None, capabilities=None):
+                     'cleanup_issue': cleanup_issue}
+         except Exception as exc:
+             cleanup_issue = _cleanup_fixture(fixture, prepared)
+-            return {'op': op, 'status': STATUS_ERROR, 'reason': type(exc).__name__ + ': ' + str(exc),
++            return {'op': op, 'status': STATUS_ERROR, 'reason': _describe_exception(exc),
+                     'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                     'cleanup_issue': cleanup_issue}
+ 
+@@ -723,7 +736,7 @@ def run_scope_operation(op, source=None, capabilities=None):
+                     'cleanup_issue': cleanup_issue}
+         except Exception as exc:  # the operation ran and failed: not a valid sample
+             cleanup_issue = _cleanup_fixture(fixture, prepared)
+-            return {'op': op, 'status': STATUS_ERROR, 'reason': type(exc).__name__ + ': ' + str(exc),
++            return {'op': op, 'status': STATUS_ERROR, 'reason': _describe_exception(exc),
+                     'scope_envelope': scope_envelope, 'envelope_issue': envelope_issue,
+                     'cleanup_issue': cleanup_issue}
+         if outcome not in (None, 0):  # a fixture that reports a non-zero status
+@@ -1006,11 +1019,17 @@ class AuthFixture:
+                 prepared['token'] = vault.login(PW, source='127.0.0.1')
+             if self.op == 'restore':
+                 prepared['package'] = vault.export_backup(prepared['token'], INDEP_PW)
+-        except BaseException:
++        except BaseException as prepare_error:
++            # A failed preparation must still tear down its temporary vault, but
++            # the cleanup failure must never be swallowed and must never replace
++            # the preparation error: the preparation error stays the raised
++            # exception, and the cleanup failure is preserved on it (as a note,
++            # which the traceback renders) so both are traceable.
+             try:
+                 self.cleanup(prepared)
+-            except Exception:  # noqa: BLE001 - never mask the preparation failure
+-                pass
++            except Exception as cleanup_error:  # noqa: BLE001 - reported, never hidden
++                prepare_error.add_note('fixture cleanup also failed: ' +
++                                       type(cleanup_error).__name__ + ': ' + str(cleanup_error))
+             raise
+         return prepared
+ 
+@@ -1078,15 +1097,24 @@ class AuthFixture:
+             raise Blocked('no auth fixture for ' + op)
+ 
+ 
++# ------------------------------------------------- capability binding (P0-5) --
++#
++# The benchmark -- never the operator -- binds every capability-driven operation
++# to its real business entry point. The operator's capability file may only
++# *enable* an operation; it can never name an executable, an interpreter, an
++# argv, a printed result or a timeout, because a subprocess that merely exits
++# zero (or prints a convincing JSON blob) is no proof that a business operation
++# ran. The benchmark constructs the real object graph from function.py's own
++# classes and invokes the real method in-process inside the measuring scope, and
++# it is the *real return value* -- not anything a process printed -- that is
++# verified.
++
+ # Panel/module operations that require a genuinely deployed capability.
+ CAPABILITY_OPS = PANEL_OPS + (MODULE_METADATA_OP,)
+ 
+ # The canonical real business entry point behind every capability-driven
+-# operation. A capability specification must name exactly the entry point of the
+-# operation it claims to measure: a generic program, a bare ``exit 0`` or one
+-# meaningless command renamed for several operations can never stand in for a
+-# genuine business operation. The command must additionally print a verifiable
+-# result that identifies the operation (see :data:`CAPABILITY_RESULT_KIND`).
++# operation. These names are the benchmark's own binding; they are never taken
++# from operator input and are used only to document and construct the call.
+ CAPABILITY_ENTRYPOINTS = {
+     'qr': 'function.PanelBackend.qr',
+     'diagnostics': 'function.PanelBackend.detail',
+@@ -1094,128 +1122,211 @@ CAPABILITY_ENTRYPOINTS = {
+     'module-metadata': 'function.PanelBackend.metadata',
+ }
+ 
+-# The only supported verifiable-result kind: the business entry must print one
+-# JSON object on stdout that identifies the operation and carries the declared
+-# business result fields. A bare exit status is never accepted as proof.
+-CAPABILITY_RESULT_KIND = 'json'
+-
+-
+-def _capability_result_contract_problem(contract):
+-    """Return a reason when a capability result contract cannot verify anything."""
+-    if not isinstance(contract, dict):
+-        return 'missing'
+-    if contract.get('kind') != CAPABILITY_RESULT_KIND:
+-        return 'of an unsupported kind'
+-    op_field = contract.get('op_field', 'operation')
+-    if not isinstance(op_field, str) or not op_field:
+-        return 'malformed: op_field'
+-    expect = contract.get('expect')
+-    if not isinstance(expect, dict) or not expect:
+-        return 'malformed: expect must declare the expected business result'
+-    return None
++# Deployed locations the benchmark uses to construct the real object graph.
++PANEL_CONFIG_PATH = '/etc/node-panel/panel-config.json'
++XRAY_CONFIG_PATH = '/usr/local/etc/xray/config.json'
++
++# Fields a capability specification must never carry: each names something the
++# benchmark would have to *execute* or print, so they are refused outright.
++CAPABILITY_COMMAND_FIELDS = ('entrypoint', 'argv', 'command', 'exec', 'program',
++                             'shell', 'result', 'timeout', 'interpreter')
+ 
+ 
+-def _verify_capability_result(op, contract, stdout):
+-    """Return a reason when ``stdout`` does not prove ``op`` really ran.
++def _capability_spec_problem(op, spec):
++    """Return a reason when an operator capability spec tries to name a command.
+ 
+-    The result must be a JSON object whose identity field names ``op`` and which
+-    carries every declared expected business field. This binds the measurement
+-    to the actual operation, so exit status alone is never accepted.
++    A valid specification is the boolean ``true`` (or an empty object), which
++    only *enables* the operation. Any object that carries a command-bearing field
++    is refused, so a capability file can never smuggle in an arbitrary command,
++    an interpreter or a result to print.
+     """
++    if spec is True:
++        return None
++    if isinstance(spec, dict):
++        named = sorted(k for k in CAPABILITY_COMMAND_FIELDS if k in spec)
++        if named:
++            return ('names ' + ', '.join(named) + '; the benchmark binds the ' + op +
++                    ' business entry itself and refuses operator-supplied commands')
++        if spec:
++            return 'carries unexpected fields: ' + ', '.join(sorted(spec))
++        return None
++    if spec is False or spec is None:
++        return 'is not enabled'
++    return 'is malformed'
++
++
++def _verify_module_metadata(panel_config, result):
++    """Return a reason when the real ``metadata`` result is not the real config."""
++    if not isinstance(result, dict):
++        return 'expected a metadata mapping'
+     try:
+-        doc = json.loads((stdout or b'').decode('utf-8', 'replace'))
+-    except (ValueError, UnicodeError):
+-        return 'did not print a JSON result'
+-    if not isinstance(doc, dict):
+-        return 'did not print a JSON object result'
+-    op_field = contract.get('op_field', 'operation')
+-    if doc.get(op_field) != op:
+-        return 'result does not identify the ' + op + ' business operation'
+-    for key, value in (contract.get('expect') or {}).items():
+-        if doc.get(key) != value:
+-            return 'result field ' + repr(key) + ' does not match the expected business output'
++        expected = json.loads(Path(panel_config).read_bytes())
++    except FileNotFoundError:
++        expected = {}
++    except (OSError, ValueError):
++        expected = None
++    if expected is not None and result != expected:
++        return 'metadata does not match the configured panel metadata'
+     return None
+ 
+ 
+-class CapabilityFixture:
+-    """Fixture for operations that need a genuinely deployed capability.
++def _verify_qr(result):
++    """Return a reason when ``qr`` did not return a real SVG payload."""
++    import base64
++    import binascii
++    if not isinstance(result, str) or not result:
++        return 'expected a base64 SVG payload'
++    try:
++        raw = base64.b64decode(result, validate=True)
++    except (ValueError, binascii.Error):
++        return 'payload is not valid base64'
++    if b'<svg' not in raw:
++        return 'payload is not an SVG image'
++    return None
+ 
+-    A capability is described by an explicit specification supplied to the
+-    measuring scope::
+ 
+-        {op: {"entrypoint": <real business entry>, "argv": [...],
+-              "timeout": seconds,
+-              "result": {"kind": "json", "op_field": "operation",
+-                         "expect": {"ok": true, ...}}}}
++def _verify_diagnostics(result):
++    """Return a reason when ``detail`` did not return a diagnostics mapping."""
++    if not isinstance(result, dict):
++        return 'expected a diagnostics mapping'
++    for key in ('ip', 'country', 'note'):
++        if key not in result:
++            return 'diagnostics mapping is missing ' + key
++    return None
+ 
+-    ``entrypoint`` must name the operation's real business entry point (see
+-    :data:`CAPABILITY_ENTRYPOINTS`) and ``result`` must declare a verifiable
+-    result contract. With no specification — or with one that names no real
+-    entry point, no verifiable result, an empty command or any other placeholder
+-    — the operation is BLOCKED; no capability and no measurement is ever invented
+-    to make a run pass. The command runs inside the scope, so its memory is
+-    accounted to the scope's ``memory.peak``. A non-zero exit status, a timeout,
+-    a launch failure or a result that does not prove the business operation ran
+-    is a failed operation, never a valid sample.
++
++# Builder that constructs the real object graph for one capability operation.
++# The benchmark owns this registry: an operation's entry point is never taken
++# from operator input.
++def _capability_build_qr(function, vault, gate, panel_config, xray_config, prepared):
++    if not Path(xray_config).is_file():
++        raise Blocked('qr requires a readable Xray configuration at ' + str(xray_config))
++    xray = function.XrayTransaction(vault.store, xray_config, gate, None, None, vault.validate)
++    backend = _capability_backend(function, vault, gate, panel_config, xray)
++    nodes = backend.nodes(prepared['token'], False)
++    if not nodes:
++        raise Blocked('qr requires a configured Xray node; none is available')
++    prepared['ident'] = nodes[0]['id']
++    return backend
++
++
++def _capability_backend(function, vault, gate, panel_config, xray=None):
++    import active as active_module
++    coordinator = function.Coordinator(vault, active_module.Active(), gate, xray=xray)
++    return function.PanelBackend(coordinator, panel_config=panel_config)
++
++
++class CapabilityRunner:
++    """Benchmark-owned binding from an operation to its real business call.
++
++    The benchmark constructs the real object graph with function.py's real
++    classes and calls the real business method in-process, inside the measuring
++    scope, so the operation's memory is charged to that scope. The operator
++    supplies no command of any kind: :meth:`prepare` refuses any specification
++    that names one, and refuses any operation whose real dependencies cannot be
++    satisfied. A real return value is always required; a printed blob or a zero
++    exit status can never stand in for it.
+     """
+ 
+-    def __init__(self, op, capabilities):
++    def __init__(self, op, capability=True, *, panel_config=None, xray_config=None,
++                 gate=None, workspace=None):
+         self.op = op
+-        self.capabilities = capabilities or {}
++        self.capability = capability
++        self.panel_config = Path(panel_config) if panel_config is not None else Path(PANEL_CONFIG_PATH)
++        self.xray_config = Path(xray_config) if xray_config is not None else Path(XRAY_CONFIG_PATH)
++        self.gate = gate if gate is not None else _NullGate()
++        self.workspace = Path(workspace) if workspace is not None else None
++        self._owned_root = None
+ 
+     def prepare(self):
++        import function
+         if self.op not in CAPABILITY_OPS:
+             raise Blocked(self.op + ' has no capability-driven business entry point')
+-        spec = self.capabilities.get(self.op)
+-        if not isinstance(spec, dict):
+-            raise Blocked(self.op + ' has no provisioned capability; refusing to invent one')
+-        expected = CAPABILITY_ENTRYPOINTS.get(self.op)
+-        if spec.get('entrypoint') != expected:
+-            raise Blocked(self.op + ' capability does not name its real business entry point ' +
+-                          repr(expected))
+-        argv = spec.get('argv')
+-        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
+-            raise Blocked(self.op + ' capability argv is missing or malformed')
+-        timeout = spec.get('timeout', 60)
+-        if type(timeout) is not int or timeout <= 0:
+-            raise Blocked(self.op + ' capability timeout is malformed')
+-        problem = _capability_result_contract_problem(spec.get('result'))
++        problem = _capability_spec_problem(self.op, self.capability)
+         if problem is not None:
+-            raise Blocked(self.op + ' capability result contract is ' + problem)
+-        return {'argv': list(argv), 'timeout': timeout, 'result': dict(spec['result'])}
++            raise Blocked(self.op + ' capability ' + problem)
++        if self.op == 'xray-test':
++            raise Blocked('xray-test requires a real Xray executable and a measured task '
++                          'launcher (function.BoundedCommand with isolated execution); neither '
++                          'can be safely synthesised, so the operation is BLOCKED')
++        root = self.workspace
++        if root is None:
++            root = Path(tempfile.mkdtemp(prefix='rpb-cap-'))
++            self._owned_root = root
++        prepared = {'root': root}
++        try:
++            import auth as auth_module
++            vault = auth_module.Auth(str(root), gate=self.gate)
++            prepared['auth'] = vault
++            if self.op in ('qr', 'diagnostics'):
++                vault.initialize(PW, PW, local_authority=True)
++                prepared['token'] = vault.login(PW, source='127.0.0.1')
++            if self.op == 'module-metadata':
++                prepared['backend'] = _capability_backend(function, vault, self.gate, self.panel_config)
++            elif self.op == 'qr':
++                prepared['backend'] = _capability_build_qr(function, vault, self.gate, self.panel_config,
++                                                           self.xray_config, prepared)
++            elif self.op == 'diagnostics':
++                prepared['backend'] = _capability_backend(function, vault, self.gate, self.panel_config)
++                prepared['headers'] = {}
++            return prepared
++        except BaseException:
++            self._teardown(prepared)
++            raise
+ 
+     def invoke(self, prepared):
+-        """Run the provisioned command and reject any non-successful outcome.
+-
+-        The exit status must be zero *and* the printed result must prove the
+-        declared business operation actually ran; a plain ``exit 0`` command is
+-        therefore never accepted as a valid sample.
+-        """
+-        try:
+-            completed = subprocess.run(prepared['argv'], stdout=subprocess.PIPE,
+-                                       stderr=subprocess.DEVNULL, timeout=prepared['timeout'],
+-                                       check=False)
+-        except subprocess.TimeoutExpired:
+-            raise OperationFailed(self.op + ' capability exceeded its timeout of ' +
+-                                  str(prepared['timeout']) + 's') from None
+-        except OSError as exc:
+-            raise OperationFailed(self.op + ' capability could not be executed: ' +
+-                                  type(exc).__name__) from None
+-        if completed.returncode != 0:
+-            raise OperationFailed(self.op + ' capability exited with status ' +
+-                                  str(completed.returncode))
+-        problem = _verify_capability_result(self.op, prepared['result'], completed.stdout)
++        op = self.op
++        backend = prepared['backend']
++        if op == 'module-metadata':
++            result = backend.metadata()
++            problem = _verify_module_metadata(self.panel_config, result)
++        elif op == 'qr':
++            result = backend.qr(prepared['token'], prepared['ident'])
++            problem = _verify_qr(result)
++        elif op == 'diagnostics':
++            result = backend.detail(prepared['token'], 'visitor', prepared['headers'])
++            problem = _verify_diagnostics(result)
++        else:
++            raise Blocked(op + ' has no capability-driven business entry point')
+         if problem is not None:
+-            raise OperationFailed(self.op + ' capability did not prove the business operation ran: ' +
++            raise OperationFailed(op + ' business operation did not produce the expected result: ' +
+                                   problem)
+-        return completed.returncode
++        return 0
++
++    def cleanup(self, prepared=None):
++        """Release the fixture; report a cleanup failure instead of hiding it."""
++        self._teardown(prepared)
++
++    def _teardown(self, prepared):
++        if not prepared:
++            return
++        error = None
++        auth_obj = prepared.get('auth')
++        if auth_obj is not None and hasattr(auth_obj, 'close'):
++            try:
++                auth_obj.close()
++            except Exception as exc:  # noqa: BLE001 - still remove our own directory
++                error = exc
++        root = prepared.get('root')
++        if root is not None and root == self._owned_root:
++            import shutil
++            try:
++                shutil.rmtree(str(root))
++            except FileNotFoundError:
++                pass
++            except OSError as exc:
++                if error is None:
++                    error = exc
++        if error is not None:
++            raise error
+ 
+ 
+ def build_fixture(op, capabilities=None):
+     if op in AUTH_OPS:
+         return AuthFixture(op)
+-    if op in PANEL_OPS or op == MODULE_METADATA_OP:
+-        return CapabilityFixture(op, capabilities)
++    if op in CAPABILITY_OPS:
++        caps = capabilities if capabilities is not None else default_capabilities()
++        return CapabilityRunner(op, caps.get(op, False))
+     if op in EXTERNAL_OPS:
+         raise Blocked(op + ' must be measured externally')
+     raise BenchmarkError('unknown operation ' + str(op))
+@@ -1224,15 +1335,21 @@ def build_fixture(op, capabilities=None):
+ def default_capabilities():
+     """No capability is assumed.
+ 
+-    Panel and module operations stay BLOCKED until a deployment provisions an
+-    explicit command specification; inventing a capability would falsify the
+-    measurement.
++    Panel and module operations stay BLOCKED until a deployment *enables* them;
++    enabling only permits the benchmark to attempt its own real binding, which
++    still BLOCKS when the operation's real dependencies are unavailable.
+     """
+     return {}
+ 
+ 
+ def load_capabilities(path):
+-    """Load a capability specification file, or the fail-closed default."""
++    """Load a capability enablement file, refusing any operator-supplied command.
++
++    ``None`` yields the fail-closed default. The file must be a JSON object that
++    maps each operation to ``true`` (or an empty object). Any entry that names an
++    executable, an argv, an interpreter or a result to print is refused, so the
++    file can never smuggle in an arbitrary command.
++    """
+     if not path:
+         return default_capabilities()
+     raw = Path(path).read_bytes()
+@@ -1244,6 +1361,10 @@ def load_capabilities(path):
+         raise BenchmarkError('capability specification is not valid JSON') from None
+     if not isinstance(doc, dict):
+         raise BenchmarkError('capability specification must be an object')
++    for op, spec in doc.items():
++        problem = _capability_spec_problem(op, spec)
++        if problem is not None:
++            raise BenchmarkError('capability ' + str(op) + ' ' + problem)
+     return doc
+ 
+ 
+@@ -1634,6 +1755,16 @@ def _fsync_dir(path):
+         os.close(fd)
+ 
+ 
++def _fsync_fd(fd):
++    """Flush one open descriptor's bytes and metadata to stable storage.
++
++    Kept as its own seam so the write-ahead journal's *file* fsync is distinct
++    from the *directory* fsync: both must complete before a formal replacement
++    is allowed, and a test can fail exactly one of them.
++    """
++    os.fsync(fd)
++
++
+ def _atomic_write(path, raw, mode=0o600):
+     """Write ``raw`` to ``path`` through a same-directory rename, then fsync.
+ 
+@@ -1773,26 +1904,23 @@ class ProfileWriter:
+         return None
+ 
+     def _journal_status(self):
+-        """Classify the persisted marker as ``'absent'``, ``'ok'`` or a reason.
+-
+-        Fail-closed: a marker that exists but cannot be read, is not a regular
+-        file or cannot be parsed is never treated as absent. Only an ``'ok'``
+-        marker may ever release the write block (see :meth:`recheck`); anything
+-        else keeps every write blocked.
++        """Classify the write-ahead journal as ``'absent'``, ``'ok'`` or a reason.
++
++        The journal is read through the same descriptor-level chain used for the
++        protected files (``O_NOFOLLOW``, ``fstat`` type/owner/mode, device/inode
++        re-check), so a symlink, a non-regular file, an untrusted owner or a file
++        swapped mid-read is never mistaken for a valid journal. Fail-closed: a
++        journal that exists but cannot be read, cannot be trusted or cannot be
++        parsed is never treated as absent; only an ``'ok'`` journal may ever
++        release the write block (see :meth:`recheck`). Read/write are checked
++        independently of the formal file's parent directory, so a presence probe
++        cannot be turned into a spurious failure.
+         """
+-        try:
+-            st = os.lstat(self.journal_path)
+-        except FileNotFoundError:
++        raw, reason = self._read_file(self.journal_path, check_parent=False)
++        if reason == 'absent':
+             return 'absent'
+-        except OSError as exc:
+-            return 'unreadable: ' + type(exc).__name__
+-        if not stat.S_ISREG(st.st_mode):
+-            return 'not a regular file'
+-        try:
+-            with open(self.journal_path, 'rb') as handle:
+-                raw = handle.read(MAX_PROFILE_BYTES + 1)
+-        except OSError as exc:
+-            return 'unreadable: ' + type(exc).__name__
++        if reason is not None:
++            return reason
+         try:
+             doc = json.loads(raw)
+         except (ValueError, UnicodeError):
+@@ -1806,7 +1934,7 @@ class ProfileWriter:
+         return self._journal_status() != 'absent'
+ 
+     @staticmethod
+-    def _read_file(path):
++    def _read_file(path, *, check_parent=True):
+         """Read a protected file through a verified descriptor; ``(raw, reason)``.
+ 
+         The file is opened with ``O_NOFOLLOW`` and then judged by its *descriptor*
+@@ -1815,14 +1943,18 @@ class ProfileWriter:
+         a regular file, and its ownership and mode must be trustworthy. The bytes
+         are read from that same verified descriptor, and the path is inspected
+         once more afterwards so a replacement during the read is detected. The
+-        parent directory's type, owner and mode are verified first. ``reason`` is
+-        ``None`` on success, otherwise a short description of why the bytes
+-        cannot be trusted. A symlink is never followed, and the descriptor is
+-        always closed, including on every error path.
++        parent directory's type, owner and mode are verified first, unless the
++        caller passes ``check_parent=False`` (the journal reader does, because a
++        mere presence probe must not be turned into a failure by an unrelated,
++        separately-checked parent problem). ``reason`` is ``None`` on success,
++        otherwise a short description of why the bytes cannot be trusted. A
++        symlink is never followed, and the descriptor is always closed, including
++        on every error path.
+         """
+-        parent_problem = _parent_directory_problem(path)
+-        if parent_problem is not None:
+-            return None, parent_problem
++        if check_parent:
++            parent_problem = _parent_directory_problem(path)
++            if parent_problem is not None:
++                return None, parent_problem
+         try:
+             pre = os.lstat(path)
+         except FileNotFoundError:
+@@ -1884,44 +2016,97 @@ class ProfileWriter:
+     def _write_file(self, path, raw):
+         _atomic_write(path, raw)
+ 
+-    def _persist_uncertain(self, reason):
+-        """Persist the COMMIT_UNCERTAIN marker; never pretend it succeeded.
+-
+-        Returns ``(persisted, detail)``. A failure to make the marker durable is
+-        reported, never swallowed: the in-memory block still holds for this
+-        process, and the caller can see that the cross-process marker could not
+-        be created. The marker is confirmed to exist as a regular file before the
+-        write is considered a success.
++    def _journal_payload(self, reason, transaction=None):
++        """Build the journal document: transaction identity plus recovery info."""
++        doc = {'reason': reason,
++               'generated_at': _utcnow().isoformat(),
++               'formal': os.path.abspath(self.path),
++               'backup': os.path.abspath(self.backup_path)}
++        if transaction is not None:
++            doc['transaction'] = transaction
++        return doc
++
++    def _persist_journal(self, payload, *, exclusive):
++        """Make the journal durable; returns ``(persisted, detail)``.
++
++        Crash-safety is what matters here, not visibility. The bytes are written
++        to a descriptor opened with ``O_NOFOLLOW`` and, when ``exclusive`` is set,
++        ``O_CREAT|O_EXCL`` (so a symlink or a pre-existing file is refused), then
++        flushed with a *file* fsync **and** a *directory* fsync before the call
++        reports success. Only when both fsyncs succeeded is the journal re-read
++        through the verified-descriptor chain and confirmed to carry exactly the
++        bytes written. Any failure — an unsafe or pre-existing path, a write
++        error, either fsync, or a read-back mismatch — returns ``(False, reason)``
++        so the caller stops *before* touching the formal profile. A file that is
++        merely visible is never reported as durable.
+         """
+-        payload = _canonical({'reason': reason,
+-                              'generated_at': _utcnow().isoformat(),
+-                              'formal': os.path.abspath(self.path),
+-                              'backup': os.path.abspath(self.backup_path)}).encode('ascii')
++        raw = _canonical(payload).encode('ascii')
++        parent_problem = _parent_directory_problem(self.journal_path)
++        if parent_problem is not None:
++            return False, 'journal parent directory is unsafe: ' + parent_problem
++        existing_problem = _symlink_problem(self.journal_path)
++        if existing_problem is not None:
++            return False, 'existing journal is unsafe: ' + existing_problem
++        if exclusive:
++            try:
++                os.lstat(self.journal_path)
++            except FileNotFoundError:
++                pass
++            except OSError as exc:
++                return False, 'cannot inspect the journal: ' + type(exc).__name__
++            else:
++                return False, 'a journal already exists, so the transaction is unfinished'
++        directory = os.path.dirname(os.path.abspath(self.journal_path))
++        flags = os.O_WRONLY | os.O_CREAT | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
++        flags |= os.O_EXCL if exclusive else os.O_TRUNC
+         try:
+-            _atomic_write(self.journal_path, payload)
+-        except UncertainWrite:
+-            # The rename already made the marker visible; the durability of the
+-            # rename is unprovable, but the next process can still see it. Verified
+-            # below.
+-            pass
+-        except OSError:
+-            # The marker's own durable replace failed (e.g. the same directory
+-            # fsync is failing); fall back to a plain, visible write.
++            fd = os.open(self.journal_path, flags, 0o600)
++        except OSError as exc:
++            return False, 'cannot create the journal: ' + type(exc).__name__
++        try:
++            os.fchmod(fd, 0o600)
++            written = 0
++            while written < len(raw):
++                written += os.write(fd, raw[written:])
+             try:
+-                with open(self.journal_path, 'wb') as handle:
+-                    handle.write(payload)
+-                    handle.flush()
+-                    os.fsync(handle.fileno())
++                _fsync_fd(fd)
+             except OSError as exc:
+-                return False, type(exc).__name__ + ': ' + str(exc)
++                return False, 'journal file fsync failed: ' + type(exc).__name__
++        except OSError as exc:
++            return False, 'journal write failed: ' + type(exc).__name__
++        finally:
++            os.close(fd)
+         try:
+-            st = os.lstat(self.journal_path)
++            _fsync_dir(directory)
+         except OSError as exc:
+-            return False, 'marker not visible: ' + type(exc).__name__
+-        if not stat.S_ISREG(st.st_mode):
+-            return False, 'marker is not a regular file'
++            return False, 'journal directory fsync failed: ' + type(exc).__name__
++        back, reason = self._read_file(self.journal_path, check_parent=False)
++        if reason is not None:
++            return False, 'journal is not durable: ' + reason
++        if back != raw:
++            return False, 'journal read-back did not match the bytes written'
+         return True, None
+ 
++    def _clear_journal(self):
++        """Durably remove the journal; ``True`` only when removal is proven.
++
++        The journal is unlinked and its directory fsynced. A missing file counts
++        as already cleared, but an unlink failure or a directory fsync failure
++        returns ``False``: the removal is then not proven to survive a crash, so
++        the caller must keep the transaction blocked rather than assume safety.
++        """
++        try:
++            os.unlink(self.journal_path)
++        except FileNotFoundError:
++            return True
++        except OSError:
++            return False
++        try:
++            _fsync_dir(os.path.dirname(os.path.abspath(self.journal_path)))
++        except OSError:
++            return False
++        return True
++
+     def _scan(self):
+         """Read-only view of the recoverable state of both protected files."""
+         formal_raw, formal_reason = self._read_file(self.path)
+@@ -1943,21 +2128,18 @@ class ProfileWriter:
+ 
+         This is the explicit recovery checkpoint. It re-reads the formal profile
+         and its backup independently; only when it can confirm a trustworthy
+-        on-disk state *and* the persisted marker is well-formed does it clear the
+-        marker and release the write block. A missing, unreadable or corrupt
+-        marker, or a formal/backup pair that cannot be confirmed, keeps the block
+-        (fail-closed). The two files are never described as a single atomic
+-        transaction.
++        on-disk state *and* the journal is well-formed does it clear the journal
++        *durably* (unlink plus directory fsync) and release the write block. A
++        missing, unreadable, unparseable or unsafe journal, a formal/backup pair
++        that cannot be confirmed, or a journal whose removal is not proven to
++        survive a crash, all keep the block (fail-closed). The two files are
++        never described as a single atomic transaction.
+         """
+         state = self._scan()
+         status = self._journal_status()
+         released = False
+         if status == 'ok' and state['recoverable']:
+-            try:
+-                os.unlink(self.journal_path)
+-                released = True
+-            except OSError:
+-                released = False
++            released = self._clear_journal()
+         if released:
+             self.disabled = False
+             self.uncertain = False
+@@ -1969,19 +2151,27 @@ class ProfileWriter:
+         return state
+ 
+     def install(self, candidate_raw, *, force=False, confirmed=False):
+-        """Commit a candidate profile to the formal path.
+-
+-        ``force`` only permits replacing an existing *valid* formal profile. It
+-        never bypasses completeness, equivalence, feasibility, threshold,
+-        confirmation or the COMMIT_UNCERTAIN recovery check. ``confirmed``
+-        records the required interactive confirmation. A rename that succeeded
+-        without a proven directory fsync (or a re-read that does not match)
+-        enters COMMIT_UNCERTAIN, persists a marker and poisons the writer across
+-        processes.
++        """Commit a candidate profile to the formal path through a write-ahead log.
++
++        The protocol is: (1) the recovery gate below runs first and ``--force``
++        can never skip it; (2) a write-ahead journal, carrying the transaction
++        identity and recovery information, is made durable (file fsync plus
++        directory fsync) *before* any change to the formal profile — if it cannot
++        be made durable the commit stops with the formal profile untouched; (3)
++        the backup and then the formal file are replaced; (4) the formal file is
++        re-read and must match the candidate bytes; (5) only once the durable
++        formal state is proven is the journal durably removed, which releases the
++        block. A replace that completed without a proven directory fsync, a
++        re-read mismatch, or a journal that cannot be cleared, all enter
++        COMMIT_UNCERTAIN and poison the writer across processes until
++        :meth:`recheck` confirms the on-disk state. ``force`` only permits
++        replacing an existing *valid* formal profile; it never bypasses
++        completeness, equivalence, feasibility, confirmation or the recovery.
+         """
+-        # Cross-process recovery first: a persisted uncertain marker blocks every
+-        # write until an explicit recheck confirms the state. This runs before
+-        # ``force`` is consulted, so --force can never skip it.
++        # Cross-process recovery first: a persisted journal (or an in-memory
++        # block) refuses every write until an explicit recheck confirms the
++        # state. This runs before ``force`` is consulted, so --force can never
++        # skip it.
+         if self.disabled or self.uncertain or self._journal_present():
+             self.disabled = True
+             self.uncertain = True
+@@ -2015,40 +2205,69 @@ class ProfileWriter:
+         existing_valid, _existing, _existing_issues = self._verify(existing_raw)
+         if existing_valid and not force:
+             return {'state': ABORTED, 'reasons': ['a valid formal profile exists; --force required']}
++        # --- write-ahead journal: record the intent durably BEFORE any change ---
++        transaction = hashlib.sha256(candidate_raw).hexdigest()
++        persisted, detail = self._persist_journal(
++            self._journal_payload('commit in progress', transaction=transaction), exclusive=True)
++        if not persisted:
++            reason = ('the write-ahead journal could not be made durable (' + str(detail) +
++                      '); refusing to change the formal profile')
++            if not self._clear_journal():
++                self.disabled = True
++                self.uncertain = True
++                reason += ('; and the incomplete journal could not be cleared, so further '
++                           'writes stay blocked until recheck')
++            return {'state': ABORTED, 'reasons': [reason]}
+         # Back up only a *verified* existing formal; an invalid file is no backup.
+         if existing_valid:
+             try:
+                 self._write_file(self.backup_path, existing_raw)
+             except (OSError, UncertainWrite) as exc:
+-                return {'state': ABORTED, 'reasons': ['backup write failed: ' + type(exc).__name__]}
++                reasons = ['backup write failed: ' + type(exc).__name__]
++                if not self._clear_journal():
++                    self.disabled = True
++                    self.uncertain = True
++                    reasons.append('the write-ahead journal could not be cleared; further '
++                                   'writes stay blocked until recheck')
++                return {'state': ABORTED, 'reasons': reasons}
+         try:
+             _atomic_write(self.path, candidate_raw)
+         except UncertainWrite:
+             return self.mark_uncertain('formal rename completed but its directory fsync failed')
+         except OSError as exc:
+-            return {'state': ABORTED, 'reasons': ['formal write failed: ' + type(exc).__name__]}
++            reasons = ['formal write failed: ' + type(exc).__name__]
++            if not self._clear_journal():
++                self.disabled = True
++                self.uncertain = True
++                reasons.append('the write-ahead journal could not be cleared; further writes '
++                               'stay blocked until recheck')
++            return {'state': ABORTED, 'reasons': reasons}
+         reread, _reread_reason = self._read_file(self.path)
+         if reread != candidate_raw:
+             return self.mark_uncertain('formal re-read did not match the candidate bytes')
++        # --- confirm: the durable formal state is proven; clear the journal ---
++        if not self._clear_journal():
++            return self.mark_uncertain('the formal profile is durable but its write-ahead '
++                                       'journal could not be durably cleared')
+         return {'state': COMMITTED, 'reasons': [], 'fingerprint': profile['fingerprint'],
+                 'backup_written': existing_valid}
+ 
+     def mark_uncertain(self, reason):
+         """Enter COMMIT_UNCERTAIN after a post-replace durability failure.
+ 
+-        The state is persisted to disk so it survives the process, and the
+-        writer stays poisoned for every later write until :meth:`recheck`
+-        confirms the files. If the marker itself cannot be made durable the
+-        outcome stays COMMIT_UNCERTAIN (never a success) and the failure is
+-        reported, so a broken marker is never mistaken for a safe state.
++        The journal is (re)written durably so the uncertainty survives the
++        process and blocks every later write until :meth:`recheck` confirms the
++        files. If the journal itself cannot be made durable the outcome stays
++        COMMIT_UNCERTAIN (never a success) and the failure is reported, so a
++        broken journal is never mistaken for a safe state.
+         """
+         self.disabled = True
+         self.uncertain = True
+-        persisted, detail = self._persist_uncertain(reason)
++        persisted, detail = self._persist_journal(self._journal_payload(reason), exclusive=False)
+         result = {'state': COMMIT_UNCERTAIN, 'reasons': [reason],
+                   'recheck': self._scan(), 'marker_persisted': persisted}
+         if not persisted:
+-            result['reasons'].append('the COMMIT_UNCERTAIN marker could not be persisted (' +
++            result['reasons'].append('the COMMIT_UNCERTAIN journal could not be made durable (' +
+                                      str(detail) + '); this process still refuses every further write')
+         return result
+ 

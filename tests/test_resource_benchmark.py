@@ -63,34 +63,78 @@ def make_doc(envelope, op='install-panel', samples=(1000, 1010, 1020, 1005, 1015
     return doc
 
 
-# ------------------------------------------------- capability test doubles --
-# A capability is a real business entry point plus a verifiable result contract.
-# The stand-in command below prints exactly the JSON result a real entry point is
-# required to emit, so tests can exercise the contract without a deployed panel.
-# The negative tests prove that a bare ``exit 0``, an empty command, a wrong
-# entry point, a mismatched result or a shared meaningless success can never be
-# accepted in its place.
+# ------------------------------------------------ capability test support --
+# The benchmark -- never the operator -- binds every capability-driven operation
+# to its real business entry point, and only the *real return value* of that
+# method is verified. There is no field for a command, an interpreter or a
+# printed result, so the helpers below construct the real object graph that
+# function.py's own classes expect instead of fabricating a success.
 
-def capability_argv(op):
-    program = 'import json; print(json.dumps({"operation": %r, "ok": True}))' % (op,)
-    return [sys.executable, '-c', program]
-
-
-def capability_spec(op, argv=None, timeout=5, entrypoint=None, result=None):
-    return {'entrypoint': rb.CAPABILITY_ENTRYPOINTS[op] if entrypoint is None else entrypoint,
-            'argv': capability_argv(op) if argv is None else argv,
-            'timeout': timeout,
-            'result': ({'kind': 'json', 'op_field': 'operation', 'expect': {'ok': True}}
-                       if result is None else result)}
+def _write_json(path, value):
+    Path(path).write_bytes(json.dumps(value).encode('utf-8'))
+    return path
 
 
-def capability_caps(*ops):
-    return dict((op, capability_spec(op)) for op in ops)
+def panel_config_file(directory, metadata=None):
+    """Real panel-config content, in the shape ``PanelBackend.metadata`` reads."""
+    return _write_json(os.path.join(directory, 'panel.json'),
+                       metadata if metadata is not None
+                       else {'ws': {'listen_port': 8443, 'host': 'example.com', 'port': 443}})
 
 
-def panel_capabilities():
-    """Capability specs for every capability-driven operation (test double)."""
-    return capability_caps(*(rb.PANEL_OPS + (rb.MODULE_METADATA_OP,)))
+def xray_config_file(directory):
+    """A minimal but real Xray configuration with one VLESS/WS inbound."""
+    inbound = {'protocol': 'vless', 'port': 10000, 'tag': 'vps-monitor-ws',
+               'settings': {'clients': [{'id': '11111111-1111-1111-1111-111111111111'}]},
+               'streamSettings': {'network': 'ws', 'security': 'tls',
+                                  'wsSettings': {'path': '/ws'}}}
+    return _write_json(os.path.join(directory, 'xray.json'), {'inbounds': [inbound]})
+
+
+def enabled_caps(*ops):
+    """Enablement-only capability specs: each named op is turned on with ``True``."""
+    return dict((op, True) for op in ops)
+
+
+def _fail_fsync_dir_on(call_index):
+    """Patch target that fails the directory fsync on exactly one call.
+
+    A write-ahead journal must fsync its directory *and* the formal replace must
+    fsync its directory, so "the journal directory fsync failed" and "the formal
+    directory fsync failed" are distinct failures. Failing one call by index lets
+    a test reproduce each without weakening the other.
+    """
+    real = rb._fsync_dir
+    state = {'n': 0}
+
+    def patched(path):
+        state['n'] += 1
+        if state['n'] == call_index:
+            raise OSError('directory fsync refused')
+        return real(path)
+    return patched
+
+
+def _fail_open_for(suffix):
+    """Patch target for ``os.open`` that refuses one path suffix only."""
+    real = os.open
+
+    def patched(path, *args, **kwargs):
+        if os.fspath(path).endswith(suffix):
+            raise OSError('open refused')
+        return real(path, *args, **kwargs)
+    return patched
+
+
+def _fail_unlink_for(suffix):
+    """Patch target for ``os.unlink`` that refuses one path suffix only."""
+    real = os.unlink
+
+    def patched(path, *args, **kwargs):
+        if os.fspath(path).endswith(suffix):
+            raise OSError('unlink refused')
+        return real(path, *args, **kwargs)
+    return patched
 
 
 def _closable():
@@ -429,18 +473,37 @@ class FixtureTests(BenchBase):
             fixture.cleanup(second)
             self.assertFalse(first['root'].exists())
 
-    def test_capability_fixture_fails_closed(self):
-        with self.assertRaises(rb.Blocked):
-            rb.CapabilityFixture('qr', {}).prepare()
-        with self.assertRaises(rb.Blocked):
-            rb.CapabilityFixture('qr', {'qr': {'argv': []}}).prepare()
-        with self.assertRaises(rb.Blocked):
-            rb.CapabilityFixture('qr', {'qr': {'argv': ['/bin/true'], 'timeout': 0}}).prepare()
+    def test_capability_spec_never_names_a_command(self):
+        # An operator may only *enable* an operation; every command-bearing field
+        # is refused so a capability file cannot smuggle in an executable, an
+        # interpreter or a result to print.
+        for spec in ({'argv': ['/bin/true']},
+                     {'entrypoint': 'function.PanelBackend.qr'},
+                     {'command': 'true'},
+                     {'exec': '/bin/true'},
+                     {'program': 'true'},
+                     {'shell': 'true'},
+                     {'interpreter': '/bin/sh'},
+                     {'result': {'ok': True}},
+                     {'timeout': 5}):
+            self.assertIsNotNone(rb._capability_spec_problem('qr', spec), spec)
+        self.assertIsNone(rb._capability_spec_problem('qr', True))
+        self.assertIsNone(rb._capability_spec_problem('qr', {}))
+        self.assertIsNotNone(rb._capability_spec_problem('qr', False))
 
-    def test_capability_fixture_runs_spec(self):
-        fixture = rb.CapabilityFixture('qr', {'qr': capability_spec('qr')})
-        prepared = fixture.prepare()
-        self.assertEqual(fixture.invoke(prepared), 0)
+    def test_disabled_capability_is_blocked(self):
+        with self.assertRaises(rb.Blocked):
+            rb.CapabilityRunner('qr', False).prepare()
+        with self.assertRaises(rb.Blocked):
+            rb.CapabilityRunner('qr', {}).prepare()
+
+    def test_non_capability_operation_has_no_bound_entry(self):
+        with self.assertRaises(rb.Blocked):
+            rb.CapabilityRunner('login', True).prepare()
+
+    def test_xray_test_is_blocked_without_a_real_launcher(self):
+        with self.assertRaises(rb.Blocked):
+            rb.CapabilityRunner('xray-test', True).prepare()
 
     def test_default_capabilities_are_empty(self):
         self.assertEqual(rb.default_capabilities(), {})
@@ -448,8 +511,11 @@ class FixtureTests(BenchBase):
     def test_load_capabilities(self):
         self.assertEqual(rb.load_capabilities(None), {})
         path = os.path.join(self.dir, 'caps.json')
+        Path(path).write_text(json.dumps({'qr': True}))
+        self.assertEqual(rb.load_capabilities(path), {'qr': True})
         Path(path).write_text(json.dumps({'qr': {'argv': ['/bin/true']}}))
-        self.assertIn('qr', rb.load_capabilities(path))
+        with self.assertRaises(rb.BenchmarkError):
+            rb.load_capabilities(path)
         Path(path).write_text('not json')
         with self.assertRaises(rb.BenchmarkError):
             rb.load_capabilities(path)
@@ -715,7 +781,9 @@ class ProfileWriterTests(BenchBase):
 
     def test_formal_fsync_failure_is_commit_uncertain_and_poisons(self):
         writer = self.writer()
-        with mock.patch.object(rb, '_fsync_dir', side_effect=OSError('boom')):
+        # The journal's own directory fsync must succeed first; only the formal
+        # replace's directory fsync fails, so the writer enters COMMIT_UNCERTAIN.
+        with mock.patch.object(rb, '_fsync_dir', side_effect=_fail_fsync_dir_on(2)):
             result = writer.install(rb.dumps_profile(complete_profile()), confirmed=True)
         self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
         self.assertTrue(writer.uncertain)
@@ -732,6 +800,30 @@ class ProfileWriterTests(BenchBase):
 
 # --------------------------------------------------------- orchestration -----
 
+class _NoopFixture:
+    """Structural double for orchestration composition tests only.
+
+    It fabricates no business result: it exists so the composition harness can
+    drive the meter/session contract without a deployed panel. The capability
+    *trust* tests below never use it; they call the real business entry points.
+    """
+
+    def prepare(self):
+        return {}
+
+    def invoke(self, prepared):
+        return 0
+
+    def cleanup(self, prepared):
+        pass
+
+
+def _harness_fixture(op, capabilities=None):
+    if op in rb.AUTH_OPS:
+        return rb.AuthFixture(op)
+    return _NoopFixture()
+
+
 class _SessionHarness(BenchBase):
     def build(self, missing=None, capabilities=None):
         results = {}
@@ -745,10 +837,9 @@ class _SessionHarness(BenchBase):
         meter = rb.FakeMeter(results)
         pool = itertools.cycle([150000000, 149999000])
         sampler = lambda: next(pool)
-        if capabilities is None:
-            capabilities = panel_capabilities()
-        session = rb.MeasurementSession(meter, sampler, capabilities, samples=rb.N_MIN)
-        return session.run()
+        session = rb.MeasurementSession(meter, sampler, capabilities or {}, samples=rb.N_MIN)
+        with mock.patch.object(rb, 'build_fixture', _harness_fixture):
+            return session.run()
 
     def synthetic_env(self):
         cgroup = {'valid': True, 'mount_root': '/', 'mount_point': '/sys/fs/cgroup',
@@ -1112,117 +1203,207 @@ class FixtureCleanupTests(BenchBase):
         finally:
             shutil.rmtree(str(root), ignore_errors=True)
 
+    def test_auth_prepare_succeeds_and_cleanup_removes_the_vault(self):
+        fixture = rb.AuthFixture('login')
+        prepared = fixture.prepare()
+        self.assertTrue(prepared['root'].is_dir())
+        fixture.cleanup(prepared)
+        self.assertFalse(prepared['root'].exists())
 
-# ------------------------------------------------- capability results (P0-5) --
+    def test_auth_prepare_failure_keeps_the_original_error_and_still_cleans_up(self):
+        import auth as auth_module
+        fixture = rb.AuthFixture('login')
+        roots = []
+        real_mkdtemp = tempfile.mkdtemp
 
-class CapabilityResultTests(BenchBase):
-    """A capability must bind to its real business entry point and prove it ran.
+        def tracking_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            roots.append(path)
+            return path
 
-    A process that merely exits zero is never proof that a business operation
-    happened, so the fixture requires an explicit entry point plus a verifiable
-    result contract and rejects anything that does not satisfy it.
+        with mock.patch.object(rb.tempfile, 'mkdtemp', side_effect=tracking_mkdtemp), \
+                mock.patch.object(auth_module, 'Auth') as fake:
+            fake.return_value.initialize.side_effect = RuntimeError('initialize failed')
+            with self.assertRaises(RuntimeError) as caught:
+                fixture.prepare()
+        # The preparation error is the one raised, and cleanup still ran.
+        self.assertIn('initialize failed', str(caught.exception))
+        self.assertEqual(list(getattr(caught.exception, '__notes__', [])), [])
+        self.assertEqual(len(roots), 1)
+        self.assertFalse(os.path.exists(roots[0]))
+
+    def test_auth_prepare_and_cleanup_failures_are_both_traceable(self):
+        import auth as auth_module
+        fixture = rb.AuthFixture('login')
+        roots = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def tracking_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            roots.append(path)
+            return path
+
+        try:
+            with mock.patch.object(rb.tempfile, 'mkdtemp', side_effect=tracking_mkdtemp), \
+                    mock.patch.object(auth_module, 'Auth') as fake, \
+                    mock.patch.object(shutil, 'rmtree', side_effect=OSError('rmtree failed')):
+                fake.return_value.initialize.side_effect = RuntimeError('initialize failed')
+                with self.assertRaises(RuntimeError) as caught:
+                    fixture.prepare()
+            # The preparation error stays the raised exception ...
+            self.assertIn('initialize failed', str(caught.exception))
+            # ... and the cleanup failure is preserved on it, so both are traceable.
+            notes = list(getattr(caught.exception, '__notes__', []))
+            self.assertTrue(any('rmtree failed' in note for note in notes), notes)
+            described = rb._describe_exception(caught.exception)
+            self.assertIn('initialize failed', described)
+            self.assertIn('rmtree failed', described)
+        finally:
+            for root in roots:
+                shutil.rmtree(root, ignore_errors=True)
+
+
+# -------------------------------------------------- capability trust (P0-5) --
+
+class CapabilityTrustTests(BenchBase):
+    """P0-5: a capability binds to a real business entry point and proves it ran.
+
+    The benchmark -- never the operator -- binds the call, so no operator-supplied
+    command and no subprocess that merely exits zero (or prints a convincing JSON
+    blob) can ever be accepted. Only the *real return value* of function.py's own
+    business method is verified, and that call runs inside the measured scope.
     """
 
-    def fixture(self, op, spec):
-        return rb.CapabilityFixture(op, {op: spec})
+    def setUp(self):
+        super().setUp()
+        self.panel = panel_config_file(self.dir)
+        self.xray = xray_config_file(self.dir)
 
-    def run_scope(self, op, spec):
+    def runner(self, op, capability=True):
+        return rb.CapabilityRunner(op, capability, panel_config=self.panel,
+                                   xray_config=self.xray)
+
+    # --- only a real, benchmark-bound business call can succeed ---------------
+
+    def test_real_module_metadata_call_passes(self):
+        runner = self.runner('module-metadata')
+        prepared = runner.prepare()
+        try:
+            self.assertEqual(runner.invoke(prepared), 0)
+        finally:
+            runner.cleanup(prepared)
+
+    def test_real_qr_call_returns_a_real_svg(self):
+        runner = self.runner('qr')
+        prepared = runner.prepare()
+        try:
+            self.assertEqual(runner.invoke(prepared), 0)
+        finally:
+            runner.cleanup(prepared)
+
+    def test_real_diagnostics_call_returns_visitor_info(self):
+        runner = self.runner('diagnostics')
+        prepared = runner.prepare()
+        try:
+            self.assertEqual(runner.invoke(prepared), 0)
+        finally:
+            runner.cleanup(prepared)
+
+    def test_real_business_exception_fails_the_operation(self):
+        import function as function_module
+        runner = self.runner('module-metadata')
+        prepared = runner.prepare()
+        try:
+            with mock.patch.object(function_module.PanelBackend, 'metadata',
+                                   side_effect=RuntimeError('business failed')):
+                with self.assertRaises(RuntimeError):
+                    runner.invoke(prepared)
+        finally:
+            runner.cleanup(prepared)
+
+    def test_real_business_exception_is_not_a_valid_scope_sample(self):
+        import function as function_module
         tree = self.tree()
-        return rb.run_scope_operation(op, source=tree.source(), capabilities={op: spec})
+        with mock.patch.object(rb, 'PANEL_CONFIG_PATH', self.panel), \
+                mock.patch.object(function_module.PanelBackend, 'metadata',
+                                  side_effect=RuntimeError('business failed')):
+            result = rb.run_scope_operation('module-metadata', source=tree.source(),
+                                            capabilities=enabled_caps('module-metadata'))
+        self.assertEqual(result['status'], rb.STATUS_ERROR)
+        self.assertIn('business failed', result['reason'])
 
-    def test_arbitrary_exit_zero_command_is_rejected(self):
-        # 'raise SystemExit(0)' proves nothing about the qr business operation.
-        spec = capability_spec('qr', argv=[sys.executable, '-c', 'raise SystemExit(0)'])
-        fixture = self.fixture('qr', spec)
-        with self.assertRaises(rb.OperationFailed) as caught:
-            fixture.invoke(fixture.prepare())
-        self.assertIn('did not prove', str(caught.exception))
+    # --- an operator command can never be supplied ----------------------------
 
-    def test_arbitrary_exit_zero_is_not_a_valid_scope_sample(self):
-        spec = capability_spec('qr', argv=[sys.executable, '-c', 'raise SystemExit(0)'])
-        self.assertEqual(self.run_scope('qr', spec)['status'], rb.STATUS_ERROR)
+    def test_command_bearing_capability_is_blocked(self):
+        # The exact anti-pattern the audit named: a command that exits zero and
+        # prints {"operation": "qr", "ok": true}. There is simply no field for it.
+        command = [sys.executable, '-c',
+                   'import json; print(json.dumps({"operation": "qr", "ok": True}))']
+        for spec in ({'argv': command},
+                     {'entrypoint': 'function.PanelBackend.qr', 'argv': command},
+                     {'command': command},
+                     {'program': command[0], 'argv': command},
+                     {'result': {'operation': 'qr', 'ok': True}},
+                     {'interpreter': sys.executable, 'argv': command},
+                     {'timeout': 5, 'argv': command}):
+            with self.assertRaises(rb.Blocked):
+                self.runner('qr', spec).prepare()
 
-    def test_empty_command_is_blocked(self):
-        with self.assertRaises(rb.Blocked):
-            self.fixture('qr', capability_spec('qr', argv=[])).prepare()
+    def test_scope_operation_refuses_an_operator_command(self):
+        tree = self.tree()
+        caps = {'module-metadata': {'argv': [sys.executable, '-c', 'raise SystemExit(0)']}}
+        result = rb.run_scope_operation('module-metadata', source=tree.source(), capabilities=caps)
+        self.assertEqual(result['status'], rb.STATUS_BLOCKED)
+
+    def test_printed_ok_json_is_never_a_business_result(self):
+        # The verifiers see the real return value, never anything a process printed.
+        blob = {'operation': 'qr', 'ok': True}
+        self.assertIsNotNone(rb._verify_qr(blob))
+        self.assertIsNotNone(rb._verify_diagnostics(blob))
+        self.assertIsNotNone(rb._verify_module_metadata(self.panel, blob))
+        # a path an operator points the verifier at is not a metadata result: the
+        # verifier only accepts the real mapping function.PanelBackend.metadata()
+        # returned, compared against the benchmark-owned panel config.
+        path = _write_json(os.path.join(self.dir, 'printed.json'), blob)
+        self.assertIsNotNone(rb._verify_module_metadata(self.panel, path))
+
+    def test_wrong_business_value_is_rejected(self):
+        # A result for one operation is never accepted for another.
+        metadata = json.loads(Path(self.panel).read_bytes())
+        self.assertIsNotNone(rb._verify_qr(metadata))           # a mapping is not an SVG payload
+        self.assertIsNotNone(rb._verify_diagnostics(metadata))  # missing ip/country/note
+        import base64
+        svg = base64.b64encode(b'<svg></svg>').decode('ascii')
+        self.assertIsNotNone(rb._verify_diagnostics(svg))       # a string is not a diagnostics mapping
+        self.assertIsNotNone(rb._verify_module_metadata(self.panel, {'operation': 'qr', 'ok': True}))
+
+    def test_module_metadata_must_match_the_configured_metadata(self):
+        # Even a "successful" mapping is refused when it is not the real config.
+        runner = self.runner('module-metadata')
+        prepared = runner.prepare()
+        try:
+            with mock.patch.object(prepared['backend'], 'metadata',
+                                   return_value={'operation': 'qr', 'ok': True}):
+                with self.assertRaises(rb.OperationFailed):
+                    runner.invoke(prepared)
+        finally:
+            runner.cleanup(prepared)
+
+    # --- the scope path enforces the same binding ------------------------------
 
     def test_missing_capability_is_blocked(self):
         with self.assertRaises(rb.Blocked):
-            rb.CapabilityFixture('qr', {}).prepare()
-        result = rb.run_scope_operation('qr', source=self.tree().source(), capabilities={})
-        self.assertEqual(result['status'], rb.STATUS_BLOCKED)
-
-    def test_wrong_business_entrypoint_is_blocked(self):
-        spec = capability_spec('qr', entrypoint='function.GenericTool.__call__')
-        with self.assertRaises(rb.Blocked):
-            self.fixture('qr', spec).prepare()
-
-    def test_missing_result_contract_is_blocked(self):
-        spec = capability_spec('qr')
-        del spec['result']
-        with self.assertRaises(rb.Blocked):
-            self.fixture('qr', spec).prepare()
-
-    def test_nonzero_exit_is_a_failed_operation(self):
-        argv = [sys.executable, '-c',
-                'import json, sys; print(json.dumps({"operation": "qr", "ok": True})); sys.exit(3)']
-        fixture = self.fixture('qr', capability_spec('qr', argv=argv))
-        with self.assertRaises(rb.OperationFailed):
-            fixture.invoke(fixture.prepare())
-
-    def test_timeout_is_a_failed_operation(self):
-        argv = [sys.executable, '-c', 'import time; time.sleep(30)']
-        fixture = self.fixture('qr', capability_spec('qr', argv=argv, timeout=1))
-        with self.assertRaises(rb.OperationFailed):
-            fixture.invoke(fixture.prepare())
-
-    def test_unlaunchable_command_is_a_failed_operation(self):
-        fixture = self.fixture('qr', capability_spec('qr', argv=['/nonexistent/benchmark-binary-xyz']))
-        with self.assertRaises(rb.OperationFailed):
-            fixture.invoke(fixture.prepare())
-
-    def test_result_that_does_not_identify_the_operation_is_rejected(self):
-        # A diagnostics-shaped success can never stand in for the qr operation.
-        argv = [sys.executable, '-c',
-                'import json; print(json.dumps({"operation": "diagnostics", "ok": True}))']
-        fixture = self.fixture('qr', capability_spec('qr', argv=argv))
-        with self.assertRaises(rb.OperationFailed):
-            fixture.invoke(fixture.prepare())
-
-    def test_result_with_the_wrong_business_value_is_rejected(self):
-        argv = [sys.executable, '-c',
-                'import json; print(json.dumps({"operation": "qr", "ok": False}))']
-        fixture = self.fixture('qr', capability_spec('qr', argv=argv))
-        with self.assertRaises(rb.OperationFailed):
-            fixture.invoke(fixture.prepare())
-
-    def test_correct_entrypoint_with_verified_result_passes(self):
-        spec = capability_spec('qr')
-        self.assertEqual(spec['entrypoint'], rb.CAPABILITY_ENTRYPOINTS['qr'])
-        fixture = self.fixture('qr', spec)
-        self.assertEqual(fixture.invoke(fixture.prepare()), 0)
-        self.assertEqual(self.run_scope('qr', spec)['status'], rb.STATUS_OK)
-
-    def test_operations_cannot_share_one_meaningless_success(self):
-        # The same qr result must not be accepted for a different operation.
-        shared = capability_spec('qr')
-        spec = capability_spec('diagnostics', argv=list(shared['argv']))
-        fixture = self.fixture('diagnostics', spec)
-        with self.assertRaises(rb.OperationFailed):
-            fixture.invoke(fixture.prepare())
-
-    def test_scope_operation_rejects_nonzero_capability(self):
-        tree = self.tree()
-        argv = [sys.executable, '-c',
-                'import json, sys; print(json.dumps({"operation": "qr", "ok": True})); sys.exit(3)']
-        caps = {'qr': capability_spec('qr', argv=argv)}
-        result = rb.run_scope_operation('qr', source=tree.source(), capabilities=caps)
-        self.assertEqual(result['status'], rb.STATUS_ERROR)
-
-    def test_missing_capability_blocks_scope_operation(self):
+            self.runner('qr', False).prepare()
         tree = self.tree()
         result = rb.run_scope_operation('qr', source=tree.source(), capabilities={})
         self.assertEqual(result['status'], rb.STATUS_BLOCKED)
+
+    def test_real_bound_scope_operation_is_a_valid_sample(self):
+        tree = self.tree()
+        with mock.patch.object(rb, 'PANEL_CONFIG_PATH', self.panel):
+            result = rb.run_scope_operation('module-metadata', source=tree.source(),
+                                            capabilities=enabled_caps('module-metadata'))
+        self.assertEqual(result['status'], rb.STATUS_OK, result)
 
 
 # ------------------------------------------------------ scope timeout (P1-2) --
@@ -1496,104 +1677,197 @@ class CandidatePathTests(BenchBase):
         self.assertFalse(os.path.exists(formal + '.bak'))
 
 
-# ------------------------------------- commit-uncertain cross-process (P0-4) --
+# ------------------------------ commit-uncertain write-ahead log (P0-4) ------
 
 class CommitRecoveryTests(BenchBase):
+    """The write-ahead journal must be durable before the formal file changes.
+
+    Crash-safety, not visibility, is the bar: the journal is written, file
+    fsynced and directory fsynced before a single byte of the formal profile
+    changes, and only a *durably cleared* journal releases the block. Every
+    failure below is fail-closed and survives the process.
+    """
+
     def writer(self):
         return rb.ProfileWriter(os.path.join(self.dir, 'resource-profile.json'))
 
+    def complete(self):
+        return rb.dumps_profile(complete_profile())
+
+    # --- the journal is durable before the formal change ----------------------
+
+    def test_journal_write_is_durable_and_carries_the_transaction(self):
+        writer = self.writer()
+        payload = writer._journal_payload('commit in progress', transaction='deadbeef')
+        persisted, detail = writer._persist_journal(payload, exclusive=True)
+        self.assertTrue(persisted, detail)
+        doc = json.loads(Path(writer.journal_path).read_bytes())
+        self.assertEqual(doc['transaction'], 'deadbeef')
+        self.assertIn('formal', doc)
+        self.assertIn('backup', doc)
+        # A second exclusive persist refuses: the transaction is unfinished.
+        again, reason = writer._persist_journal(payload, exclusive=True)
+        self.assertFalse(again)
+        self.assertIn('already exists', reason)
+        self.assertTrue(writer._clear_journal())
+        self.assertFalse(os.path.exists(writer.journal_path))
+
+    def test_journal_creation_failure_stops_before_the_formal_change(self):
+        writer = self.writer()
+        with mock.patch.object(rb.os, 'open', side_effect=_fail_open_for(rb.UNCERTAIN_SUFFIX)):
+            result = writer.install(self.complete(), confirmed=True)
+        self.assertEqual(result['state'], rb.ABORTED)
+        self.assertFalse(os.path.exists(writer.path))
+
+    def test_journal_file_fsync_failure_stops_before_the_formal_change(self):
+        writer = self.writer()
+        with mock.patch.object(rb, '_fsync_fd', side_effect=OSError('fsync failed')):
+            result = writer.install(self.complete(), confirmed=True)
+        self.assertEqual(result['state'], rb.ABORTED)
+        self.assertFalse(os.path.exists(writer.path))
+        self.assertIn('journal', result['reasons'][0])
+
+    def test_journal_directory_fsync_failure_stops_before_the_formal_change(self):
+        writer = self.writer()
+        with mock.patch.object(rb, '_fsync_dir', side_effect=OSError('fsync failed')):
+            result = writer.install(self.complete(), confirmed=True)
+        self.assertEqual(result['state'], rb.ABORTED)
+        self.assertFalse(os.path.exists(writer.path))
+        self.assertTrue(writer.uncertain)  # clearing the journal is not proven either
+
+    # --- a formal replace that cannot be proven enters COMMIT_UNCERTAIN --------
+
+    def test_formal_replace_failure_aborts_and_clears_the_journal(self):
+        writer = self.writer()
+        with mock.patch.object(rb.os, 'replace', side_effect=OSError('replace refused')):
+            result = writer.install(self.complete(), confirmed=True)
+        self.assertEqual(result['state'], rb.ABORTED)
+        self.assertFalse(os.path.exists(writer.path))
+        self.assertFalse(os.path.exists(writer.journal_path))
+
+    def test_formal_directory_fsync_failure_is_commit_uncertain(self):
+        writer = self.writer()
+        with mock.patch.object(rb, '_fsync_dir', side_effect=_fail_fsync_dir_on(2)):
+            result = writer.install(self.complete(), confirmed=True)
+        self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
+        self.assertTrue(os.path.exists(writer.journal_path))
+        self.assertTrue(writer.uncertain)
+
+    def test_journal_that_cannot_be_cleared_is_commit_uncertain(self):
+        writer = self.writer()
+        with mock.patch.object(rb.os, 'unlink', side_effect=_fail_unlink_for(rb.UNCERTAIN_SUFFIX)):
+            result = writer.install(self.complete(), confirmed=True)
+        self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
+        self.assertTrue(os.path.exists(writer.path))  # the durable formal profile exists
+        self.assertTrue(writer.uncertain)
+
+    # --- journal safety: symlink, type and content ----------------------------
+
+    def test_journal_symlink_keeps_the_block(self):
+        writer = self.writer()
+        target = os.path.join(self.dir, 'elsewhere.json')
+        Path(target).write_bytes(b'{}')
+        os.symlink(target, writer.journal_path)
+        blocked = writer.install(self.complete(), force=True, confirmed=True)
+        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
+        state = writer.recheck()
+        self.assertEqual(state['marker'], 'symbolic link')
+        self.assertFalse(state['released'])
+        self.assertEqual(Path(target).read_bytes(), b'{}')  # the link target is untouched
+
+    def test_journal_persist_refuses_a_symlink(self):
+        writer = self.writer()
+        target = os.path.join(self.dir, 'elsewhere.json')
+        Path(target).write_bytes(b'keep')
+        os.symlink(target, writer.journal_path)
+        persisted, _detail = writer._persist_journal(writer._journal_payload('x'), exclusive=False)
+        self.assertFalse(persisted)
+        self.assertEqual(Path(target).read_bytes(), b'keep')
+
+    def test_non_regular_journal_keeps_the_block(self):
+        writer = self.writer()
+        os.mkdir(writer.journal_path)
+        blocked = writer.install(self.complete(), confirmed=True)
+        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
+        state = writer.recheck()
+        self.assertEqual(state['marker'], 'not a regular file')
+        self.assertFalse(state['released'])
+
+    def test_corrupt_journal_keeps_the_block(self):
+        writer = self.writer()
+        Path(writer.journal_path).write_bytes(b'{not json')
+        blocked = writer.install(self.complete(), force=True, confirmed=True)
+        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
+        state = writer.recheck()
+        self.assertEqual(state['marker'], 'corrupt')
+        self.assertFalse(state['released'])
+        self.assertTrue(os.path.exists(writer.journal_path))
+
+    def test_unreadable_journal_is_fail_closed(self):
+        writer = self.writer()
+        Path(writer.journal_path).write_bytes(b'{}')
+        with mock.patch.object(rb.os, 'lstat', side_effect=OSError('io error')):
+            self.assertTrue(writer._journal_present())
+            status = writer._journal_status()
+            state = writer.recheck()
+        self.assertNotEqual(status, 'ok')
+        self.assertFalse(state['released'])
+
+    # --- cross-process recovery -----------------------------------------------
+
     def test_uncertain_state_survives_writer_recreation(self):
         first = self.writer()
-        with mock.patch.object(rb, '_fsync_dir', side_effect=OSError('boom')):
-            result = first.install(rb.dumps_profile(complete_profile()), confirmed=True)
+        with mock.patch.object(rb, '_fsync_dir', side_effect=_fail_fsync_dir_on(2)):
+            result = first.install(self.complete(), confirmed=True)
         self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
         self.assertTrue(os.path.exists(first.journal_path))
         del first
         second = self.writer()
         self.assertTrue(second.uncertain)
-        blocked = second.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
+        blocked = second.install(self.complete(), force=True, confirmed=True)
         self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
         state = second.recheck()
         self.assertTrue(state['formal_valid'])
         self.assertTrue(state['released'])
         self.assertFalse(os.path.exists(second.journal_path))
-        committed = second.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
+        committed = second.install(self.complete(), force=True, confirmed=True)
         self.assertEqual(committed['state'], rb.COMMITTED)
 
     def test_force_does_not_bypass_recovery(self):
         first = self.writer()
-        with mock.patch.object(rb, '_fsync_dir', side_effect=OSError('boom')):
-            first.install(rb.dumps_profile(complete_profile()), confirmed=True)
+        with mock.patch.object(rb, '_fsync_dir', side_effect=_fail_fsync_dir_on(2)):
+            first.install(self.complete(), confirmed=True)
         second = self.writer()
-        blocked = second.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
+        blocked = second.install(self.complete(), force=True, confirmed=True)
         self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
 
     def test_recheck_keeps_the_block_when_state_is_unconfirmable(self):
         writer = self.writer()
         writer.mark_uncertain('simulated crash before any durable state')
-        state = writer.recheck()
-        self.assertFalse(state['recoverable'])
-        self.assertFalse(state['released'])
-        self.assertTrue(state['uncertain'])
-
-    def test_marker_creation_failure_is_fail_closed(self):
-        writer = self.writer()
-        with mock.patch.object(rb, '_atomic_write', side_effect=OSError('no space')), \
-                mock.patch('builtins.open', side_effect=OSError('no space')):
-            result = writer.mark_uncertain('marker could not be created')
-        self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
-        self.assertFalse(result['marker_persisted'])
-        self.assertTrue(writer.uncertain)
-        self.assertFalse(os.path.exists(writer.journal_path))
-        blocked = writer.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
-        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
-
-    def test_marker_fsync_failure_is_fail_closed(self):
-        writer = self.writer()
-        with mock.patch.object(rb, '_atomic_write', side_effect=OSError('atomic failed')), \
-                mock.patch('os.fsync', side_effect=OSError('fsync failed')):
-            result = writer.mark_uncertain('marker fsync failed')
-        self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
-        self.assertFalse(result['marker_persisted'])
-        self.assertTrue(writer.uncertain)
-
-    def test_corrupt_marker_keeps_the_block(self):
-        writer = self.writer()
-        Path(writer.journal_path).write_bytes(b'{not json')
-        blocked = writer.install(rb.dumps_profile(complete_profile()), force=True, confirmed=True)
-        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
-        state = writer.recheck()
-        self.assertEqual(state['marker'], 'corrupt')
-        self.assertFalse(state['released'])
-        self.assertTrue(state['uncertain'])
-        self.assertTrue(os.path.exists(writer.journal_path))
-
-    def test_unreadable_marker_is_fail_closed(self):
-        writer = self.writer()
-        Path(writer.journal_path).write_bytes(b'{}')
-        with mock.patch.object(rb.os, 'lstat', side_effect=OSError('io error')):
-            self.assertTrue(writer._journal_present())
-            state = writer.recheck()
-        self.assertFalse(state['released'])
-
-    def test_non_regular_marker_keeps_the_block(self):
-        writer = self.writer()
-        os.mkdir(writer.journal_path)
-        state = writer.recheck()
-        self.assertEqual(state['marker'], 'not a regular file')
-        self.assertFalse(state['released'])
-        blocked = writer.install(rb.dumps_profile(complete_profile()), confirmed=True)
-        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
-
-    def test_recheck_keeps_the_block_when_no_recoverable_file(self):
-        writer = self.writer()
-        writer.mark_uncertain('crash before any durable state')
         self.assertEqual(writer._journal_status(), 'ok')
         state = writer.recheck()
         self.assertFalse(state['recoverable'])
         self.assertFalse(state['released'])
         self.assertTrue(state['uncertain'])
         self.assertTrue(os.path.exists(writer.journal_path))
+
+    def test_mark_uncertain_journal_failure_is_fail_closed(self):
+        writer = self.writer()
+        with mock.patch.object(rb.os, 'open', side_effect=_fail_open_for(rb.UNCERTAIN_SUFFIX)):
+            result = writer.mark_uncertain('journal could not be created')
+        self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
+        self.assertFalse(result['marker_persisted'])
+        self.assertTrue(writer.uncertain)
+        blocked = writer.install(self.complete(), force=True, confirmed=True)
+        self.assertEqual(blocked['state'], rb.COMMIT_UNCERTAIN)
+
+    def test_mark_uncertain_journal_fsync_failure_is_fail_closed(self):
+        writer = self.writer()
+        with mock.patch.object(rb, '_fsync_fd', side_effect=OSError('fsync failed')):
+            result = writer.mark_uncertain('journal fsync failed')
+        self.assertEqual(result['state'], rb.COMMIT_UNCERTAIN)
+        self.assertFalse(result['marker_persisted'])
+        self.assertTrue(writer.uncertain)
 
 
 # ------------------------------------------ protected-file safety (P1-6) ------
